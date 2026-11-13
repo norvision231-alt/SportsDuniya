@@ -26,7 +26,6 @@ elif RAW_CHANNEL_ID and not RAW_CHANNEL_ID.startswith("@") and not RAW_CHANNEL_I
 
 TELEGRAM_CHANNEL_ID = RAW_CHANNEL_ID
 
-# Multi-Sport High-Speed RSS Feeds (Cricket, Football, Global Sports)
 RSS_FEEDS = [
     "https://www.espncricinfo.com/rss/content/story/feeds/0.xml",
     "http://feeds.bbci.co.uk/sport/rss.xml",
@@ -34,7 +33,6 @@ RSS_FEEDS = [
     "https://www.skysports.com/rss/12040"
 ]
 
-# High-Search SEO Keywords for Priority Ranking
 PRIORITY_KEYWORDS = [
     "india", "kohli", "rohit", "bumrah", "ipl", "bcci", "world cup", "champions trophy",
     "premier league", "champions league", "real madrid", "barcelona", "man utd", "liverpool",
@@ -57,7 +55,6 @@ def check_secrets():
         sys.exit(1)
 
 def load_state():
-    """पुराने URL हैश और टाइटल लोड करता है ताकि किसी दूसरी वेबसाइट से भी सेम खबर दोबारा न छपे"""
     if os.path.exists(HASH_FILE):
         try:
             with open(HASH_FILE, "r") as f:
@@ -87,9 +84,8 @@ def is_duplicate(url_hash, title, state):
     return False
 
 def score_entry(entry, index):
-    """खबर की ताज़गी और ट्रेंडिंग कीवर्ड्स के आधार पर टॉप न्यूज़ चुनता है"""
     text = f"{entry.get('title', '')} {entry.get('summary', '')}".lower()
-    score = max(0, 15 - index * 2)  # ताज़ा खबर को ज़्यादा अंक
+    score = max(0, 15 - index * 2)
     for kw in PRIORITY_KEYWORDS:
         if kw in text:
             score += 10
@@ -142,7 +138,6 @@ def get_article_data(entry, url):
     return image_url, article_text
 
 def watermark_image_in_ram(image_bytes):
-    """इमेज को डिस्क पर सेव किए बिना RAM में ही @SportsDuniyaOfficial बैज लगाता है"""
     with Image.open(BytesIO(image_bytes)) as img:
         img = img.convert("RGBA")
         width, height = img.size
@@ -176,7 +171,6 @@ def watermark_image_in_ram(image_bytes):
         box_x1 = box_x2 - text_w - (pad_x * 2)
         box_y1 = box_y2 - text_h - (pad_y * 2)
 
-        # सेमी-ट्रांसपेरेंट ब्लैक कैप्सूल और गोल्डन बॉर्डर लाइन
         draw.rounded_rectangle(
             [box_x1, box_y1, box_x2, box_y2],
             radius=int(font_size * 0.5),
@@ -238,12 +232,11 @@ def generate_inshorts_summary(title, description, extra_text, models):
 
     return fallback_inshorts_summary(title, description, extra_text)
 
-def post_to_telegram(image_url, summary_text, source_link):
+def post_to_telegram(image_url, summary_text):
     headers = {"User-Agent": "Mozilla/5.0"}
     img_resp = requests.get(image_url, headers=headers, timeout=15)
     img_resp.raise_for_status()
     
-    # इमेज पर @SportsDuniyaOfficial वाटरमार्क लगाएं (सीधे RAM में)
     branded_buffer = watermark_image_in_ram(img_resp.content)
     
     lines = [line.strip() for line in summary_text.split("\n") if line.strip()]
@@ -256,11 +249,10 @@ def post_to_telegram(image_url, summary_text, source_link):
         f"⚡ <b>{BRAND_TAG}</b>"
     )
     
-    # प्रोफेशनल क्लिकेबल बटन (फॉरवर्ड होने पर नए सब्सक्राइबर्स लाएंगे)
+    # सिर्फ चैनल जॉइन करने का बटन (बाहरी लिंक पूरी तरह हटा दिया गया है)
     reply_markup = {
         "inline_keyboard": [
             [
-                {"text": "📖 Read Full Story", "url": source_link},
                 {"text": "🔥 Join Sports Duniya", "url": CHANNEL_LINK}
             ]
         ]
@@ -277,7 +269,6 @@ def post_to_telegram(image_url, summary_text, source_link):
     
     res = requests.post(tg_url, data=data, files=files, timeout=20)
     
-    # मेमोरी तुरंत साफ करें (Zero Storage)
     branded_buffer.close()
     del branded_buffer
     del img_resp
@@ -307,7 +298,6 @@ def run_bot():
             score = score_entry(entry, idx)
             candidates.append((score, entry, link, url_hash, title))
             
-    # सबसे ज़्यादा ट्रेंडिंग और ताज़ा खबर को सबसे ऊपर रखें
     candidates.sort(key=lambda x: x[0], reverse=True)
     print(f"Found {len(candidates)} fresh news candidates.")
 
@@ -318,7 +308,7 @@ def run_bot():
         try:
             print(f"Posting Top News (Score {score}): {title}")
             summary = generate_inshorts_summary(title, entry.get("summary", ""), extra_text, models)
-            if post_to_telegram(image_url, summary, link):
+            if post_to_telegram(image_url, summary):
                 save_state(url_hash, title, state)
                 del summary, extra_text, image_url
                 gc.collect()
