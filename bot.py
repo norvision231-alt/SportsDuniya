@@ -1,6 +1,7 @@
 import os
 import sys
 import gc
+import time
 import html
 import json
 import hashlib
@@ -56,20 +57,41 @@ def save_hash(url_hash, hashes):
     with open(HASH_FILE, "w") as f:
         json.dump(hashes, f)
 
+def get_available_models():
+    """API पर उपलब्ध चालू मॉडल्स की लिस्ट निकालता है ताकि 503 आने पर दूसरा मॉडल काम आ सके"""
+    models = ["gemini-3.8-flash"]
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+        resp = requests.get(url, timeout=15)
+        if resp.ok:
+            discovered = []
+            for m in resp.json().get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods and any(k in name for k in ["flash", "gemma", "pro"]):
+                    if not any(bad in name for bad in ["2.5", "2.0", "1.5", "tts", "image", "audio", "vision"]):
+                        discovered.append(name)
+            # Lite और Flash मॉडल्स को सबसे आगे रखें
+            discovered.sort(key=lambda x: (0 if "lite" in x else 1 if "flash" in x else 2))
+            if discovered:
+                models = discovered[:4]
+    except Exception as e:
+        print(f"Model discovery warning: {e}")
+    print(f"Models ready for fallback: {models}")
+    return models
+
 def get_article_data(entry, url):
     image_url = None
     article_text = ""
 
-    # 1. पहले RSS Feed के अंदर मौजूद मीडिया इमेज चेक करें
     if "media_content" in entry and entry.media_content:
         image_url = entry.media_content[0].get("url")
     elif "media_thumbnail" in entry and entry.media_thumbnail:
         image_url = entry.media_thumbnail[0].get("url")
 
-    # 2. आर्टिकल पेज से इमेज और पैराग्राफ निकालें
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(resp.text, "html.parser")
         
         if not image_url:
@@ -77,17 +99,29 @@ def get_article_data(entry, url):
             if og_image and og_image.get("content"):
                 image_url = og_image["content"]
         
-        paragraphs = [p.get_text() for p in soup.find_all("p")[:5]]
-        article_text = " ".join(paragraphs)
+        paragraphs = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 40]
+        article_text = " ".join(paragraphs[:5])
     except Exception as e:
         print(f"Article scrape warning: {e}")
 
     return image_url, article_text
 
-def generate_inshorts_summary(title, description, extra_text):
-    # अपडेटेड मॉडल: gemini-3.8-flash
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
+def fallback_inshorts_summary(title, description, extra_text):
+    """अगर Google के सभी सर्वर 503 (High Demand) दें, तो खुद 55-60 शब्दों की समरी बनाता है"""
+    clean_desc = BeautifulSoup(description or "", "html.parser").get_text().strip()
+    combined = f"{clean_desc} {extra_text}".strip()
+    words = combined.split()
     
+    if len(words) > 58:
+        body = " ".join(words[:58]) + "..."
+    elif len(words) > 10:
+        body = " ".join(words)
+    else:
+        body = title
+
+    return f"{title}\n\n{body}\n\n#SportsNews #Cricket #Football #DailySports"
+
+def generate_inshorts_summary(title, description, extra_text, models):
     prompt = f"""
     You are a professional sports news editor for an Inshorts-style channel.
     Rewrite the following sports news into English with this exact structure:
@@ -103,15 +137,28 @@ def generate_inshorts_summary(title, description, extra_text):
     """
     
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    resp = requests.post(url, json=payload, timeout=20)
-    if not resp.ok:
-        raise Exception(f"Gemini API Error ({resp.status_code}): {resp.text}")
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    for model_name in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            print(f"Trying AI model: {model_name}...")
+            resp = requests.post(url, json=payload, timeout=45)
+            if resp.ok:
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            else:
+                print(f"Model {model_name} returned {resp.status_code}. Switching model...")
+                time.sleep(4)
+        except Exception as e:
+            print(f"Timeout/Error on {model_name}: {e}. Switching model...")
+            time.sleep(4)
+
+    print("All AI models are experiencing high demand (503). Using Smart Fallback Summary...")
+    return fallback_inshorts_summary(title, description, extra_text)
 
 def post_to_telegram(image_url, summary_text, source_link):
     headers = {"User-Agent": "Mozilla/5.0"}
-    img_resp = requests.get(image_url, headers=headers, timeout=10)
+    img_resp = requests.get(image_url, headers=headers, timeout=15)
     img_resp.raise_for_status()
     
     image_buffer = BytesIO(img_resp.content)
@@ -131,7 +178,7 @@ def post_to_telegram(image_url, summary_text, source_link):
         "parse_mode": "HTML"
     }
     
-    res = requests.post(tg_url, data=data, files=files, timeout=15)
+    res = requests.post(tg_url, data=data, files=files, timeout=20)
     
     image_buffer.close()
     del image_buffer
@@ -146,6 +193,7 @@ def post_to_telegram(image_url, summary_text, source_link):
 def run_bot():
     check_secrets()
     posted_hashes = load_hashes()
+    models = get_available_models()
     
     for feed_url in RSS_FEEDS:
         print(f"Checking feed: {feed_url}")
@@ -162,11 +210,12 @@ def run_bot():
                 continue
                 
             try:
-                print(f"Generating summary for: {entry.title}")
+                print(f"Preparing summary for: {entry.title}")
                 summary = generate_inshorts_summary(
                     entry.title, 
                     entry.get("summary", ""), 
-                    extra_text
+                    extra_text,
+                    models
                 )
                 
                 if post_to_telegram(image_url, summary, link):
