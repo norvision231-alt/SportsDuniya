@@ -8,11 +8,16 @@ import hashlib
 import requests
 import feedparser
 from io import BytesIO
+from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+BRAND_TAG = "@SportsDuniyaOfficial"
+CHANNEL_LINK = "https://t.me/SportsDuniyaOfficial"
 
 if "t.me/" in RAW_CHANNEL_ID:
     RAW_CHANNEL_ID = "@" + RAW_CHANNEL_ID.split("t.me/")[-1].strip("/")
@@ -21,10 +26,20 @@ elif RAW_CHANNEL_ID and not RAW_CHANNEL_ID.startswith("@") and not RAW_CHANNEL_I
 
 TELEGRAM_CHANNEL_ID = RAW_CHANNEL_ID
 
+# Multi-Sport High-Speed RSS Feeds (Cricket, Football, Global Sports)
 RSS_FEEDS = [
     "https://www.espncricinfo.com/rss/content/story/feeds/0.xml",
     "http://feeds.bbci.co.uk/sport/rss.xml",
-    "https://www.espn.com/espn/rss/news"
+    "https://www.espn.com/espn/rss/news",
+    "https://www.skysports.com/rss/12040"
+]
+
+# High-Search SEO Keywords for Priority Ranking
+PRIORITY_KEYWORDS = [
+    "india", "kohli", "rohit", "bumrah", "ipl", "bcci", "world cup", "champions trophy",
+    "premier league", "champions league", "real madrid", "barcelona", "man utd", "liverpool",
+    "arsenal", "messi", "ronaldo", "haaland", "mbappe", "ufc", "mma", "chess", "gukesh",
+    "praggnanandhaa", "hockey", "neeraj chopra", "f1", "final", "record", "breaking", "win"
 ]
 
 HASH_FILE = "posted_hashes.json"
@@ -38,28 +53,50 @@ def check_secrets():
     if not GEMINI_API_KEY:
         missing.append("GEMINI_API_KEY")
     if missing:
-        print(f"ERROR: Ye GitHub Secrets खाली हैं या सेट नहीं हैं: {', '.join(missing)}")
+        print(f"ERROR: Missing GitHub Secrets: {', '.join(missing)}")
         sys.exit(1)
-    print(f"Target Channel ID: {TELEGRAM_CHANNEL_ID}")
 
-def load_hashes():
+def load_state():
+    """पुराने URL हैश और टाइटल लोड करता है ताकि किसी दूसरी वेबसाइट से भी सेम खबर दोबारा न छपे"""
     if os.path.exists(HASH_FILE):
         try:
             with open(HASH_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, list):
+                    return {"hashes": data, "titles": []}
+                return data
         except Exception:
-            return []
-    return []
+            pass
+    return {"hashes": [], "titles": []}
 
-def save_hash(url_hash, hashes):
-    hashes.append(url_hash)
-    hashes = hashes[-100:]
+def save_state(url_hash, title, state):
+    state["hashes"].append(url_hash)
+    state["titles"].append(title.lower())
+    state["hashes"] = state["hashes"][-120:]
+    state["titles"] = state["titles"][-80:]
     with open(HASH_FILE, "w") as f:
-        json.dump(hashes, f)
+        json.dump(state, f)
+
+def is_duplicate(url_hash, title, state):
+    if url_hash in state["hashes"]:
+        return True
+    clean_title = title.lower()
+    for old_title in state["titles"]:
+        if SequenceMatcher(None, clean_title, old_title).ratio() > 0.65:
+            return True
+    return False
+
+def score_entry(entry, index):
+    """खबर की ताज़गी और ट्रेंडिंग कीवर्ड्स के आधार पर टॉप न्यूज़ चुनता है"""
+    text = f"{entry.get('title', '')} {entry.get('summary', '')}".lower()
+    score = max(0, 15 - index * 2)  # ताज़ा खबर को ज़्यादा अंक
+    for kw in PRIORITY_KEYWORDS:
+        if kw in text:
+            score += 10
+    return score
 
 def get_available_models():
-    """API पर उपलब्ध चालू मॉडल्स की लिस्ट निकालता है ताकि 503 आने पर दूसरा मॉडल काम आ सके"""
-    models = ["gemini-3.8-flash"]
+    models = ["gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
         resp = requests.get(url, timeout=15)
@@ -68,16 +105,14 @@ def get_available_models():
             for m in resp.json().get("models", []):
                 name = m.get("name", "").replace("models/", "")
                 methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods and any(k in name for k in ["flash", "gemma", "pro"]):
+                if "generateContent" in methods and any(k in name for k in ["flash", "gemma"]):
                     if not any(bad in name for bad in ["2.5", "2.0", "1.5", "tts", "image", "audio", "vision"]):
                         discovered.append(name)
-            # Lite और Flash मॉडल्स को सबसे आगे रखें
-            discovered.sort(key=lambda x: (0 if "lite" in x else 1 if "flash" in x else 2))
+            discovered.sort(key=lambda x: (0 if "lite" in x else 1))
             if discovered:
                 models = discovered[:4]
-    except Exception as e:
-        print(f"Model discovery warning: {e}")
-    print(f"Models ready for fallback: {models}")
+    except Exception:
+        pass
     return models
 
 def get_article_data(entry, url):
@@ -100,40 +135,92 @@ def get_article_data(entry, url):
                 image_url = og_image["content"]
         
         paragraphs = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 40]
-        article_text = " ".join(paragraphs[:5])
-    except Exception as e:
-        print(f"Article scrape warning: {e}")
+        article_text = " ".join(paragraphs[:6])
+    except Exception:
+        pass
 
     return image_url, article_text
 
+def watermark_image_in_ram(image_bytes):
+    """इमेज को डिस्क पर सेव किए बिना RAM में ही @SportsDuniyaOfficial बैज लगाता है"""
+    with Image.open(BytesIO(image_bytes)) as img:
+        img = img.convert("RGBA")
+        width, height = img.size
+
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        font_size = max(16, int(width * 0.028))
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+        ]
+        font = None
+        for fp in font_paths:
+            if os.path.exists(fp):
+                font = ImageFont.truetype(fp, font_size)
+                break
+        if not font:
+            font = ImageFont.load_default()
+
+        bbox = draw.textbbox((0, 0), BRAND_TAG, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+
+        pad_x = int(font_size * 0.7)
+        pad_y = int(font_size * 0.45)
+        margin = int(width * 0.025)
+
+        box_x2 = width - margin
+        box_y2 = height - margin
+        box_x1 = box_x2 - text_w - (pad_x * 2)
+        box_y1 = box_y2 - text_h - (pad_y * 2)
+
+        # सेमी-ट्रांसपेरेंट ब्लैक कैप्सूल और गोल्डन बॉर्डर लाइन
+        draw.rounded_rectangle(
+            [box_x1, box_y1, box_x2, box_y2],
+            radius=int(font_size * 0.5),
+            fill=(15, 20, 30, 200),
+            outline=(255, 195, 0, 230),
+            width=max(1, int(font_size * 0.08))
+        )
+        draw.text((box_x1 + pad_x, box_y1 + pad_y - bbox[1]), BRAND_TAG, font=font, fill=(255, 255, 255, 255))
+
+        combined = Image.alpha_composite(img, overlay).convert("RGB")
+        out_buffer = BytesIO()
+        combined.save(out_buffer, format="JPEG", quality=92)
+        out_buffer.seek(0)
+        out_buffer.name = "sports_duniya.jpg"
+        return out_buffer
+
 def fallback_inshorts_summary(title, description, extra_text):
-    """अगर Google के सभी सर्वर 503 (High Demand) दें, तो खुद 55-60 शब्दों की समरी बनाता है"""
     clean_desc = BeautifulSoup(description or "", "html.parser").get_text().strip()
     combined = f"{clean_desc} {extra_text}".strip()
     words = combined.split()
-    
-    if len(words) > 58:
-        body = " ".join(words[:58]) + "..."
-    elif len(words) > 10:
-        body = " ".join(words)
-    else:
-        body = title
-
-    return f"{title}\n\n{body}\n\n#SportsNews #Cricket #Football #DailySports"
+    body = " ".join(words[:58]) + ("..." if len(words) > 58 else "") if len(words) > 12 else title
+    return (
+        f"🔥 {title}\n\n"
+        f"{body}\n\n"
+        f"💬 What's your take on this? React below!\n\n"
+        f"#SportsNews #Cricket #Football #SportsDuniya"
+    )
 
 def generate_inshorts_summary(title, description, extra_text, models):
     prompt = f"""
-    You are a professional sports news editor for an Inshorts-style channel.
-    Rewrite the following sports news into English with this exact structure:
-    1. First line: A punchy, short headline (maximum 10 words, no markdown symbols or asterisks).
-    2. Blank line.
-    3. Body: A crisp, objective summary in strictly 50 to 60 words covering key facts, scores, or statements.
-    4. Blank line.
-    5. Relevant hashtags (e.g., #Cricket #Football #SportsNews).
+    You are the Chief Editor of '{BRAND_TAG}', a high-growth Inshorts-style Telegram sports channel.
+    Rewrite this sports news into high-retention, SEO-optimized English following this EXACT 4-part structure:
+
+    Line 1: [Sport Emoji like 🏏/⚽/🥊/♟️/🏎️] + A viral, high-hook headline (max 11 words, include main player/team name for search SEO, no asterisks or markdown).
+    Blank line.
+    Paragraph 1: Crisp Inshorts summary in strictly 50 to 60 words. Start with the biggest impact/score/fact in the first sentence. Include full searchable names of players, teams, and tournaments.
+    Blank line.
+    Line 2: A 1-line engaging fan hook starting with 💬 (e.g., "💬 Can India bounce back in the next match? React below!").
+    Blank line.
+    Line 3: 4 to 5 high-search hashtags (e.g., #Cricket #INDvsNZ #RohitSharma #Football #SportsDuniya).
 
     News Title: {title}
     News Summary: {description}
-    Additional Context: {extra_text[:1000]}
+    Additional Context: {extra_text[:1200]}
     """
     
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -141,19 +228,14 @@ def generate_inshorts_summary(title, description, extra_text, models):
     for model_name in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
         try:
-            print(f"Trying AI model: {model_name}...")
-            resp = requests.post(url, json=payload, timeout=45)
+            resp = requests.post(url, json=payload, timeout=40)
             if resp.ok:
                 data = resp.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            else:
-                print(f"Model {model_name} returned {resp.status_code}. Switching model...")
-                time.sleep(4)
-        except Exception as e:
-            print(f"Timeout/Error on {model_name}: {e}. Switching model...")
-            time.sleep(4)
+            time.sleep(3)
+        except Exception:
+            time.sleep(3)
 
-    print("All AI models are experiencing high demand (503). Using Smart Fallback Summary...")
     return fallback_inshorts_summary(title, description, extra_text)
 
 def post_to_telegram(image_url, summary_text, source_link):
@@ -161,27 +243,43 @@ def post_to_telegram(image_url, summary_text, source_link):
     img_resp = requests.get(image_url, headers=headers, timeout=15)
     img_resp.raise_for_status()
     
-    image_buffer = BytesIO(img_resp.content)
-    image_buffer.name = "news.jpg"
+    # इमेज पर @SportsDuniyaOfficial वाटरमार्क लगाएं (सीधे RAM में)
+    branded_buffer = watermark_image_in_ram(img_resp.content)
     
     lines = [line.strip() for line in summary_text.split("\n") if line.strip()]
     headline = html.escape(lines[0].replace("*", "").replace("#", ""))
     body = html.escape("\n\n".join(lines[1:]))
     
-    caption = f"<b>{headline}</b>\n\n{body}\n\n<a href='{source_link}'>Read Full Story</a>"
+    caption = (
+        f"<b>{headline}</b>\n\n"
+        f"{body}\n\n"
+        f"⚡ <b>{BRAND_TAG}</b>"
+    )
+    
+    # प्रोफेशनल क्लिकेबल बटन (फॉरवर्ड होने पर नए सब्सक्राइबर्स लाएंगे)
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {"text": "📖 Read Full Story", "url": source_link},
+                {"text": "🔥 Join Sports Duniya", "url": CHANNEL_LINK}
+            ]
+        ]
+    }
     
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    files = {"photo": image_buffer}
+    files = {"photo": branded_buffer}
     data = {
         "chat_id": TELEGRAM_CHANNEL_ID,
         "caption": caption[:1024],
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(reply_markup)
     }
     
     res = requests.post(tg_url, data=data, files=files, timeout=20)
     
-    image_buffer.close()
-    del image_buffer
+    # मेमोरी तुरंत साफ करें (Zero Storage)
+    branded_buffer.close()
+    del branded_buffer
     del img_resp
     gc.collect()
     
@@ -192,44 +290,45 @@ def post_to_telegram(image_url, summary_text, source_link):
 
 def run_bot():
     check_secrets()
-    posted_hashes = load_hashes()
+    state = load_state()
     models = get_available_models()
     
+    candidates = []
     for feed_url in RSS_FEEDS:
-        print(f"Checking feed: {feed_url}")
         feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:5]:
-            link = entry.link
+        for idx, entry in enumerate(feed.entries[:6]):
+            link = entry.get("link", "")
+            title = entry.get("title", "")
+            if not link or not title:
+                continue
             url_hash = hashlib.md5(link.encode("utf-8")).hexdigest()
+            if is_duplicate(url_hash, title, state):
+                continue
+            score = score_entry(entry, idx)
+            candidates.append((score, entry, link, url_hash, title))
             
-            if url_hash in posted_hashes:
-                continue
-                
-            image_url, extra_text = get_article_data(entry, link)
-            if not image_url:
-                continue
-                
-            try:
-                print(f"Preparing summary for: {entry.title}")
-                summary = generate_inshorts_summary(
-                    entry.title, 
-                    entry.get("summary", ""), 
-                    extra_text,
-                    models
-                )
-                
-                if post_to_telegram(image_url, summary, link):
-                    save_hash(url_hash, posted_hashes)
-                    del summary, extra_text, image_url
-                    gc.collect()
-                    print("SUCCESS: News posted to Telegram and memory cleared!")
-                    return
-            except Exception as e:
-                print(f"Failed on article '{entry.title}': {e}")
-                continue
-                
-    print("ERROR: Koi bhi post Telegram par nahi bheji ja saki.")
-    sys.exit(1)
+    # सबसे ज़्यादा ट्रेंडिंग और ताज़ा खबर को सबसे ऊपर रखें
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    print(f"Found {len(candidates)} fresh news candidates.")
+
+    for score, entry, link, url_hash, title in candidates[:8]:
+        image_url, extra_text = get_article_data(entry, link)
+        if not image_url:
+            continue
+        try:
+            print(f"Posting Top News (Score {score}): {title}")
+            summary = generate_inshorts_summary(title, entry.get("summary", ""), extra_text, models)
+            if post_to_telegram(image_url, summary, link):
+                save_state(url_hash, title, state)
+                del summary, extra_text, image_url
+                gc.collect()
+                print("SUCCESS: Branded top news posted & RAM cleared!")
+                return
+        except Exception as e:
+            print(f"Skipped candidate '{title}': {e}")
+            continue
+
+    print("No new post sent in this cycle.")
 
 if __name__ == "__main__":
     run_bot()
