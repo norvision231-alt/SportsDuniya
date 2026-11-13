@@ -13,7 +13,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# अगर गलती से t.me लिंक या बिना @ का नाम डला हो तो उसे ऑटो-फिक्स करें
 if "t.me/" in RAW_CHANNEL_ID:
     RAW_CHANNEL_ID = "@" + RAW_CHANNEL_ID.split("t.me/")[-1].strip("/")
 elif RAW_CHANNEL_ID and not RAW_CHANNEL_ID.startswith("@") and not RAW_CHANNEL_ID.startswith("-"):
@@ -22,9 +21,9 @@ elif RAW_CHANNEL_ID and not RAW_CHANNEL_ID.startswith("@") and not RAW_CHANNEL_I
 TELEGRAM_CHANNEL_ID = RAW_CHANNEL_ID
 
 RSS_FEEDS = [
-    "https://www.espn.com/espn/rss/news",
     "https://www.espncricinfo.com/rss/content/story/feeds/0.xml",
-    "http://feeds.bbci.co.uk/sport/rss.xml"
+    "http://feeds.bbci.co.uk/sport/rss.xml",
+    "https://www.espn.com/espn/rss/news"
 ]
 
 HASH_FILE = "posted_hashes.json"
@@ -57,25 +56,37 @@ def save_hash(url_hash, hashes):
     with open(HASH_FILE, "w") as f:
         json.dump(hashes, f)
 
-def get_article_data(url):
+def get_article_data(entry, url):
+    image_url = None
+    article_text = ""
+
+    # 1. पहले RSS Feed के अंदर मौजूद मीडिया इमेज चेक करें
+    if "media_content" in entry and entry.media_content:
+        image_url = entry.media_content[0].get("url")
+    elif "media_thumbnail" in entry and entry.media_thumbnail:
+        image_url = entry.media_thumbnail[0].get("url")
+
+    # 2. आर्टिकल पेज से इमेज और पैराग्राफ निकालें
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         resp = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(resp.text, "html.parser")
         
-        og_image = soup.find("meta", property="og:image")
-        image_url = og_image["content"] if og_image and og_image.get("content") else None
+        if not image_url:
+            og_image = soup.find("meta", property="og:image")
+            if og_image and og_image.get("content"):
+                image_url = og_image["content"]
         
         paragraphs = [p.get_text() for p in soup.find_all("p")[:5]]
         article_text = " ".join(paragraphs)
-        
-        return image_url, article_text
     except Exception as e:
-        print(f"Article scrape error: {e}")
-        return None, ""
+        print(f"Article scrape warning: {e}")
+
+    return image_url, article_text
 
 def generate_inshorts_summary(title, description, extra_text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # अपडेटेड मॉडल: gemini-3.8-flash
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
     
     prompt = f"""
     You are a professional sports news editor for an Inshorts-style channel.
@@ -146,7 +157,7 @@ def run_bot():
             if url_hash in posted_hashes:
                 continue
                 
-            image_url, extra_text = get_article_data(link)
+            image_url, extra_text = get_article_data(entry, link)
             if not image_url:
                 continue
                 
