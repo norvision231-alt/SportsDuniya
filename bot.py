@@ -8,6 +8,7 @@ import hashlib
 import requests
 import feedparser
 from io import BytesIO
+from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
@@ -15,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+EVENT_NAME = os.getenv("GITHUB_EVENT_NAME", "manual").strip()
 
 BRAND_TAG = "@SportsDuniyaOfficial"
 CHANNEL_LINK = "https://t.me/SportsDuniyaOfficial"
@@ -26,8 +28,11 @@ elif RAW_CHANNEL_ID and not RAW_CHANNEL_ID.startswith("@") and not RAW_CHANNEL_I
 
 TELEGRAM_CHANNEL_ID = RAW_CHANNEL_ID
 
+# 5 High-Frequency Sports Feeds (Guaranteed Fresh News Every Hour)
 RSS_FEEDS = [
     "https://www.espncricinfo.com/rss/content/story/feeds/0.xml",
+    "https://feeds.feedburner.com/ndtvsports-latest",
+    "https://feeds.feedburner.com/ndtvsports-cricket",
     "http://feeds.bbci.co.uk/sport/rss.xml",
     "https://www.espn.com/espn/rss/news",
     "https://www.skysports.com/rss/12040"
@@ -41,6 +46,11 @@ PRIORITY_KEYWORDS = [
 ]
 
 HASH_FILE = "posted_hashes.json"
+
+def get_ist_now():
+    """सटीक भारतीय समय (IST: UTC+5:30) निकालता है"""
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist_tz)
 
 def check_secrets():
     missing = []
@@ -60,17 +70,20 @@ def load_state():
             with open(HASH_FILE, "r") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    return {"hashes": data, "titles": []}
+                    return {"hashes": data, "titles": [], "last_post_ts": 0}
+                if "last_post_ts" not in data:
+                    data["last_post_ts"] = 0
                 return data
         except Exception:
             pass
-    return {"hashes": [], "titles": []}
+    return {"hashes": [], "titles": [], "last_post_ts": 0}
 
 def save_state(url_hash, title, state):
     state["hashes"].append(url_hash)
     state["titles"].append(title.lower())
-    state["hashes"] = state["hashes"][-120:]
-    state["titles"] = state["titles"][-80:]
+    state["hashes"] = state["hashes"][-150:]
+    state["titles"] = state["titles"][-100:]
+    state["last_post_ts"] = int(time.time())
     with open(HASH_FILE, "w") as f:
         json.dump(state, f)
 
@@ -85,7 +98,7 @@ def is_duplicate(url_hash, title, state):
 
 def score_entry(entry, index):
     text = f"{entry.get('title', '')} {entry.get('summary', '')}".lower()
-    score = max(0, 15 - index * 2)
+    score = max(0, 20 - index)
     for kw in PRIORITY_KEYWORDS:
         if kw in text:
             score += 10
@@ -249,7 +262,6 @@ def post_to_telegram(image_url, summary_text):
         f"⚡ <b>{BRAND_TAG}</b>"
     )
     
-    # सिर्फ चैनल जॉइन करने का बटन (बाहरी लिंक पूरी तरह हटा दिया गया है)
     reply_markup = {
         "inline_keyboard": [
             [
@@ -281,13 +293,28 @@ def post_to_telegram(image_url, summary_text):
 
 def run_bot():
     check_secrets()
+    ist_now = get_ist_now()
+    print(f"Current IST Time: {ist_now.strftime('%Y-%m-%d %I:%M %p IST')} | Trigger: {EVENT_NAME}")
+
+    # 1. रात 12:00 AM से 4:00 AM IST तक ऑटोमेटिक पोस्टिंग बंद रखें
+    if EVENT_NAME == "schedule" and 0 <= ist_now.hour < 4:
+        print("Night Pause Active (12:00 AM to 4:00 AM IST). Skipping automatic post.")
+        return
+
     state = load_state()
+
+    # 2. चूंकि बैकअप के लिए क्रॉन हर 30 मिनट पर है, इसलिए चेक करें कि पिछली पोस्ट को कम से कम 45 मिनट हो गए हों
+    minutes_since_last = (int(time.time()) - state.get("last_post_ts", 0)) / 60
+    if EVENT_NAME == "schedule" and minutes_since_last < 45:
+        print(f"Last post was {int(minutes_since_last)} mins ago. Waiting for next hourly window.")
+        return
+
     models = get_available_models()
     
     candidates = []
     for feed_url in RSS_FEEDS:
         feed = feedparser.parse(feed_url)
-        for idx, entry in enumerate(feed.entries[:6]):
+        for idx, entry in enumerate(feed.entries[:15]):
             link = entry.get("link", "")
             title = entry.get("title", "")
             if not link or not title:
@@ -301,7 +328,7 @@ def run_bot():
     candidates.sort(key=lambda x: x[0], reverse=True)
     print(f"Found {len(candidates)} fresh news candidates.")
 
-    for score, entry, link, url_hash, title in candidates[:8]:
+    for score, entry, link, url_hash, title in candidates[:12]:
         image_url, extra_text = get_article_data(entry, link)
         if not image_url:
             continue
