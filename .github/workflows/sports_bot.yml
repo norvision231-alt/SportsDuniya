@@ -2,16 +2,16 @@ name: SportsDuniya Auto News Bot
 
 on:
   schedule:
-    # हर 30 मिनट में ऑटो-चेक ताकि क्रॉन इंजन 24x7 एक्टिव रहे
-    - cron: '5,35 * * * *'
+    - cron: '15 */5 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: sports-duniya-cron-engine
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   post-news:
@@ -29,9 +29,17 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: Start Built-in Python Cron Job
+      - name: Start Built-in Python Cron Job (Groq + Gemini)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python -u bot.py
+
+      - name: Auto-Restart Next 5.5h Shift Immediately
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run sports_bot.yml --repo ${{ github.repository }} || true
