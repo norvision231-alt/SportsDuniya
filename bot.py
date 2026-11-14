@@ -35,7 +35,7 @@ RSS_FEEDS = [
     "https://www.espncricinfo.com/rss/content/story/feeds/0.xml",
     "https://feeds.feedburner.com/ndtvsports-latest",
     "https://feeds.feedburner.com/ndtvsports-cricket",
-    "http://feeds.bbci.co.uk/sport/rss.xml",
+    "http://feeds.bbci.co.uk/sport/rss/rss.xml",
     "https://www.espn.com/espn/rss/news",
     "https://www.skysports.com/rss/12040"
 ]
@@ -47,10 +47,9 @@ PRIORITY_KEYWORDS = [
     "praggnanandhaa", "hockey", "neeraj chopra", "f1", "final", "record", "breaking", "win"
 ]
 
-# Top 20 Indian & Global Languages for Linked Group Members
 TOP_20_LANGUAGES = {
     "hi": ("🇮🇳 हिंदी", "Simple, natural Hindi (Devanagari script)"),
-    "hinglish": ("🔥 Hinglish", "Conversational Hinglish (Hindi written in English alphabet)"),
+    "hinglish": ("🔥 Hinglish", "Conversational Hinglish (Hindi in English alphabet)"),
     "en": ("🇬🇧 English", "Crisp, easy-to-read English"),
     "mr": ("🇮🇳 मराठी", "Natural Marathi (Devanagari script)"),
     "bn": ("🇮🇳 বাংলা", "Natural Bengali"),
@@ -146,6 +145,17 @@ def load_state():
             pass
     return default_state
 
+def clean_text_links(text):
+    """अजीब लिंक्स, ट्रैकिंग पैरामीटर्स और एरर यूआरएल को टेक्स्ट से पूरी तरह हटाता है"""
+    if not text:
+        return ""
+    # Remove URL patterns
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    # Remove file paths or edgesuite errors
+    text = re.sub(r'\b[\w.-]+\.(edgesuite|net|com|org|edu|gov|mil)\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'#\w+\.\w+', '', text)
+    return text.strip()
+
 def is_duplicate(url_hash, title, state):
     if url_hash in state["hashes"]:
         return True
@@ -185,7 +195,6 @@ def get_available_models():
     return models
 
 def call_ai_text(prompt, models, max_tokens=500):
-    """Groq + Gemini 3.8 Flash Fast Dual Engine"""
     if GROQ_API_KEY:
         for groq_model in [
             "llama-3.3-70b-versatile",
@@ -254,7 +263,6 @@ def get_article_data(entry, url):
     return image_url, article_text
 
 def create_fallback_banner(headline_text):
-    """अगर किसी साइट की इमेज डाउनलोड न हो सके, तो HD स्पोर्ट्स बैनर खुद बनाएं"""
     img = Image.new("RGB", (1280, 720), color=(14, 20, 34))
     draw = ImageDraw.Draw(img)
     draw.rectangle([28, 28, 1252, 692], outline=(255, 195, 0), width=6)
@@ -271,7 +279,7 @@ def create_fallback_banner(headline_text):
             break
 
     draw.text((75, 85), "⚡ BREAKING SPORTS UPDATE", font=font_sub, fill=(255, 195, 0))
-    clean_h = re.sub(r"[^\w\s.,!?'\":;-]", "", headline_text).strip() or "Latest Sports News Update"
+    clean_h = re.sub(r"[^\p{L}\p{N}\s.,!?'\":;-]", "", headline_text).strip() or "Latest Sports News Update"
     words = clean_h.split()
     lines = [" ".join(words[i:i+6]) for i in range(0, len(words), 6)]
     y_pos = 210
@@ -285,7 +293,8 @@ def create_fallback_banner(headline_text):
     return buf.read()
 
 def download_image_bypass_403(image_url, source_link=""):
-    """NDTV और अन्य साइटों के 403 Forbidden एरर को बायपास करने के लिए 4-लेयर सिस्टम"""
+    if not image_url:
+        return None
     clean_url = image_url.split("?")[0] if "ndtvimg.com" in image_url else image_url
     encoded_full = urllib.parse.quote(image_url, safe="")
     encoded_clean = urllib.parse.quote(clean_url, safe="")
@@ -398,16 +407,12 @@ def generate_inshorts_summary(title, description, extra_text, models):
         return res
     return fallback_inshorts_summary(title, description, extra_text)
 
-# =========================================================
-# MAIN CHANNEL POST (NO INLINE BUTTON -> CLEAN POST + COMMENTS)
-# =========================================================
 def post_to_telegram(image_url, summary_text, source_link=""):
     lines = [line.strip() for line in summary_text.split("\n") if line.strip()]
     raw_headline = lines[0].replace("*", "").replace("#", "") if lines else "Sports News"
 
     img_bytes = download_image_bypass_403(image_url, source_link)
     if not img_bytes:
-        print("[IMAGE FALLBACK] Generating custom SportsDuniya HD banner...")
         img_bytes = create_fallback_banner(raw_headline)
 
     branded_buffer = watermark_image_in_ram(img_bytes)
@@ -423,7 +428,6 @@ def post_to_telegram(image_url, summary_text, source_link=""):
 
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": branded_buffer}
-    # No inline_keyboard on main channel post so Telegram's native Comments bar appears!
     data = {
         "chat_id": TELEGRAM_CHANNEL_ID,
         "caption": caption[:1024],
@@ -446,7 +450,8 @@ def post_to_telegram(image_url, summary_text, source_link=""):
 # LINKED GROUP AUTO-HINDI + PERSONAL TOP-20 LANGUAGE SYSTEM
 # =========================================================
 def translate_sports_post(raw_text, lang_code, models, short_for_popup=False):
-    cache_key = f"{hashlib.md5(raw_text.encode('utf-8')).hexdigest()[:10]}_{lang_code}_{'pop' if short_for_popup else 'full'}"
+    cleaned_src = clean_text_links(raw_text)
+    cache_key = f"{hashlib.md5(cleaned_src.encode('utf-8')).hexdigest()[:10]}_{lang_code}_{'pop' if short_for_popup else 'full'}"
     if cache_key in TRANSLATION_CACHE:
         return TRANSLATION_CACHE[cache_key]
 
@@ -455,14 +460,14 @@ def translate_sports_post(raw_text, lang_code, models, short_for_popup=False):
         prompt = (
             f"Translate and summarize this sports news into {lang_desc} in strictly under 175 characters "
             f"(so it fits inside a Telegram popup alert). Keep key player/team names and score intact. "
-            f"No markdown or asterisks:\n\n{raw_text}"
+            f"No markdown or asterisks:\n\n{cleaned_src}"
         )
         out = call_ai_text(prompt, models, max_tokens=150)
         if out:
             out = out.replace("*", "").replace("#", "").strip()[:190]
             TRANSLATION_CACHE[cache_key] = out
             return out
-        return raw_text[:190]
+        return cleaned_src[:190]
 
     prompt = (
         f"Translate this sports news post into {lang_desc}.\n"
@@ -470,14 +475,14 @@ def translate_sports_post(raw_text, lang_code, models, short_for_popup=False):
         f"1. Line 1: Keep the sport emoji + catchy translated headline.\n"
         f"2. Blank line, then full accurate translation of the news paragraph.\n"
         f"3. Do NOT use asterisks (*) or markdown symbols.\n\n"
-        f"Text:\n{raw_text}"
+        f"Text:\n{cleaned_src}"
     )
     out = call_ai_text(prompt, models, max_tokens=500)
     if out:
         out = out.replace("*", "").strip()
         TRANSLATION_CACHE[cache_key] = out
         return out
-    return raw_text
+    return cleaned_src
 
 def build_group_translation_keyboard(source_msg_id):
     return {
@@ -505,14 +510,10 @@ def handle_linked_channel_post_in_group(msg, models):
     chat_id = msg["chat"]["id"]
     msg_id = msg["message_id"]
     raw_text = (msg.get("caption") or msg.get("text") or "").strip()
-    if len(raw_text) < 20:
+    if len(raw_text) < 15:
         return
 
-    clean_lines = [
-        line for line in raw_text.split("\n")
-        if not line.strip().startswith("#") and BRAND_TAG not in line
-    ]
-    clean_source = "\n".join(clean_lines).strip()
+    clean_source = clean_text_links(raw_text)
     POST_SOURCE_TEXT[str(msg_id)] = clean_source
 
     hindi_text = translate_sports_post(clean_source, "hi", models, short_for_popup=False)
@@ -579,8 +580,6 @@ def execute_news_post(state, models, force=False):
 
     for score, entry, link, url_hash, title in candidates[:12]:
         image_url, extra_text = get_article_data(entry, link)
-        if not image_url:
-            continue
         try:
             print(f"[POSTING] Score {score}: {title}")
             summary = generate_inshorts_summary(title, entry.get("summary", ""), extra_text, models)
@@ -700,25 +699,12 @@ def poll_telegram_commands(state, models):
                     lang_label, _ = TOP_20_LANGUAGES.get(user_lang, TOP_20_LANGUAGES["hi"])
                     popup_tr = translate_sports_post(raw_src, user_lang, models, short_for_popup=True)
 
-                    # 1. Private Screen Popup (केवल क्लिक करने वाले मेंबर की स्क्रीन पर दिखेगा!)
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
                         data={
                             "callback_query_id": cb_id,
                             "text": f"{lang_label}:\n{popup_tr}"[:198],
                             "show_alert": True
-                        },
-                        timeout=8
-                    )
-
-                    # 2. पूरा अनुवाद उस यूज़र के Private DM में भी भेज दें
-                    full_tr = translate_sports_post(raw_src, user_lang, models, short_for_popup=False)
-                    requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        data={
-                            "chat_id": user_id,
-                            "text": f"🌐 <b>{lang_label} Translation:</b>\n\n{html.escape(full_tr)}\n\n⚡ <b>{BRAND_TAG}</b>",
-                            "parse_mode": "HTML"
                         },
                         timeout=8
                     )
@@ -860,7 +846,6 @@ def poll_telegram_commands(state, models):
                 text = msg["text"].strip()
                 low_text = text.lower()
 
-                # ग्रुप में /settings या /lang कमांड
                 if low_text.startswith("/settings") or low_text.startswith("/lang"):
                     if chat_type == "private":
                         send_or_edit_panel(chat_id, state)
@@ -916,7 +901,7 @@ def run_cron_scheduler():
     start_ts = time.time()
     last_log_ts = 0
 
-    print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins | Non-Blocking Mode ON")
+    print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins | Clean Link Mode ON")
     while (time.time() - start_ts) < 19500:
         execute_news_post(state, models, force=False)
 
