@@ -20,26 +20,21 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install Dependencies
         run: pip install -r requirements.txt
-
-      - name: Start Built-in Python Cron Job (Groq + Gemini)
+      - name: Run Sports Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python -u bot.py
-
-      - name: Auto-Restart Next 5.5h Shift Immediately
+      - name: Auto Restart Next Session
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run sports_bot.yml --repo ${{ github.repository }} || true
+        run: gh workflow run sports_bot.yml --repo ${{ github.repository }} || true
