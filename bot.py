@@ -7,6 +7,7 @@ import html
 import json
 import hashlib
 import threading
+import urllib.parse
 import requests
 import feedparser
 from io import BytesIO
@@ -46,10 +47,10 @@ PRIORITY_KEYWORDS = [
     "praggnanandhaa", "hockey", "neeraj chopra", "f1", "final", "record", "breaking", "win"
 ]
 
-# Top 20 Indian & International Languages for Linked Group Members
+# Top 20 Indian & Global Languages for Linked Group Members
 TOP_20_LANGUAGES = {
     "hi": ("🇮🇳 हिंदी", "Simple, natural Hindi (Devanagari script)"),
-    "hinglish": ("🔥 Hinglish", "Conversational Hinglish (Hindi in English alphabet)"),
+    "hinglish": ("🔥 Hinglish", "Conversational Hinglish (Hindi written in English alphabet)"),
     "en": ("🇬🇧 English", "Crisp, easy-to-read English"),
     "mr": ("🇮🇳 मराठी", "Natural Marathi (Devanagari script)"),
     "bn": ("🇮🇳 বাংলা", "Natural Bengali"),
@@ -86,7 +87,6 @@ def check_secrets():
     if not GROQ_API_KEY and not GEMINI_API_KEY:
         print("ERROR: Both GROQ_API_KEY and GEMINI_API_KEY are missing!")
         sys.exit(1)
-    # किसी पुराने Webhook को हटाएं ताकि getUpdates कभी न अटके
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
@@ -110,7 +110,6 @@ def _background_git_push():
         os.system("git push origin main >/dev/null 2>&1 || true")
 
 def save_state(state, push_to_git=False):
-    """तुरंत 1ms में लोकल फाइल सेव करता है और Git Push बैकग्राउंड थ्रेड में चलाता है ताकि बॉट कभी हैंग न हो"""
     state["hashes"] = state["hashes"][-150:]
     state["titles"] = state["titles"][-100:]
     try:
@@ -254,6 +253,67 @@ def get_article_data(entry, url):
 
     return image_url, article_text
 
+def create_fallback_banner(headline_text):
+    """अगर किसी साइट की इमेज डाउनलोड न हो सके, तो HD स्पोर्ट्स बैनर खुद बनाएं"""
+    img = Image.new("RGB", (1280, 720), color=(14, 20, 34))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([28, 28, 1252, 692], outline=(255, 195, 0), width=6)
+
+    font_title = ImageFont.load_default()
+    font_sub = ImageFont.load_default()
+    for fp in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+    ]:
+        if os.path.exists(fp):
+            font_title = ImageFont.truetype(fp, 44)
+            font_sub = ImageFont.truetype(fp, 34)
+            break
+
+    draw.text((75, 85), "⚡ BREAKING SPORTS UPDATE", font=font_sub, fill=(255, 195, 0))
+    clean_h = re.sub(r"[^\w\s.,!?'\":;-]", "", headline_text).strip() or "Latest Sports News Update"
+    words = clean_h.split()
+    lines = [" ".join(words[i:i+6]) for i in range(0, len(words), 6)]
+    y_pos = 210
+    for ln in lines[:5]:
+        draw.text((75, y_pos), ln, font=font_title, fill=(255, 255, 255))
+        y_pos += 68
+
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+    return buf.read()
+
+def download_image_bypass_403(image_url, source_link=""):
+    """NDTV और अन्य साइटों के 403 Forbidden एरर को बायपास करने के लिए 4-लेयर सिस्टम"""
+    clean_url = image_url.split("?")[0] if "ndtvimg.com" in image_url else image_url
+    encoded_full = urllib.parse.quote(image_url, safe="")
+    encoded_clean = urllib.parse.quote(clean_url, safe="")
+    stripped_scheme = re.sub(r"^https?://", "", clean_url)
+
+    candidate_urls = [
+        f"https://wsrv.nl/?url={encoded_clean}&w=1280&output=jpg",
+        f"https://wsrv.nl/?url={encoded_full}&output=jpg",
+        f"https://i0.wp.com/{stripped_scheme}",
+        clean_url,
+        image_url
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": "https://www.google.com/"
+    }
+
+    for try_url in candidate_urls:
+        try:
+            r = requests.get(try_url, headers=headers, timeout=10)
+            if r.ok and len(r.content) > 2500:
+                return r.content
+        except Exception:
+            continue
+    return None
+
 def watermark_image_in_ram(image_bytes):
     with Image.open(BytesIO(image_bytes)) as img:
         img = img.convert("RGBA")
@@ -327,7 +387,7 @@ def generate_inshorts_summary(title, description, extra_text, models):
     Blank line.
     Line 2: A 1-line engaging fan hook starting with 💬 (e.g., "💬 Can India bounce back in the next match? Comment below!").
     Blank line.
-    Line 3: 4 to 5 high-search hashtags (e.g., #Cricket #INDvsNZ #RohitSharma #Football #SportsDuniya).
+    Line 3: 4 to 5 high-search hashtags (e.g., #Cricket #INDvsPAK #RohitSharma #Football #SportsDuniya).
 
     News Title: {title}
     News Summary: {description}
@@ -342,18 +402,17 @@ def generate_inshorts_summary(title, description, extra_text, models):
 # MAIN CHANNEL POST (NO INLINE BUTTON -> CLEAN POST + COMMENTS)
 # =========================================================
 def post_to_telegram(image_url, summary_text, source_link=""):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Referer": source_link if source_link else "https://www.google.com/"
-    }
-    img_resp = requests.get(image_url, headers=headers, timeout=12)
-    img_resp.raise_for_status()
-
-    branded_buffer = watermark_image_in_ram(img_resp.content)
-
     lines = [line.strip() for line in summary_text.split("\n") if line.strip()]
-    headline = html.escape(lines[0].replace("*", "").replace("#", ""))
+    raw_headline = lines[0].replace("*", "").replace("#", "") if lines else "Sports News"
+
+    img_bytes = download_image_bypass_403(image_url, source_link)
+    if not img_bytes:
+        print("[IMAGE FALLBACK] Generating custom SportsDuniya HD banner...")
+        img_bytes = create_fallback_banner(raw_headline)
+
+    branded_buffer = watermark_image_in_ram(img_bytes)
+
+    headline = html.escape(raw_headline)
     body = html.escape("\n\n".join(lines[1:]))
 
     caption = (
@@ -364,6 +423,7 @@ def post_to_telegram(image_url, summary_text, source_link=""):
 
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": branded_buffer}
+    # No inline_keyboard on main channel post so Telegram's native Comments bar appears!
     data = {
         "chat_id": TELEGRAM_CHANNEL_ID,
         "caption": caption[:1024],
@@ -374,7 +434,7 @@ def post_to_telegram(image_url, summary_text, source_link=""):
 
     branded_buffer.close()
     del branded_buffer
-    del img_resp
+    del img_bytes
     gc.collect()
 
     if not res.ok:
@@ -494,7 +554,6 @@ def execute_news_post(state, models, force=False):
     candidates = []
     req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
 
-    # 8-Second Strict Timeout per RSS Feed so feedparser NEVER hangs the bot!
     for feed_url in RSS_FEEDS:
         try:
             r = requests.get(feed_url, headers=req_headers, timeout=8)
@@ -641,13 +700,25 @@ def poll_telegram_commands(state, models):
                     lang_label, _ = TOP_20_LANGUAGES.get(user_lang, TOP_20_LANGUAGES["hi"])
                     popup_tr = translate_sports_post(raw_src, user_lang, models, short_for_popup=True)
 
-                    # Private Popup Alert (केवल क्लिक करने वाले मेंबर को दिखेगा!)
+                    # 1. Private Screen Popup (केवल क्लिक करने वाले मेंबर की स्क्रीन पर दिखेगा!)
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
                         data={
                             "callback_query_id": cb_id,
                             "text": f"{lang_label}:\n{popup_tr}"[:198],
                             "show_alert": True
+                        },
+                        timeout=8
+                    )
+
+                    # 2. पूरा अनुवाद उस यूज़र के Private DM में भी भेज दें
+                    full_tr = translate_sports_post(raw_src, user_lang, models, short_for_popup=False)
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        data={
+                            "chat_id": user_id,
+                            "text": f"🌐 <b>{lang_label} Translation:</b>\n\n{html.escape(full_tr)}\n\n⚡ <b>{BRAND_TAG}</b>",
+                            "parse_mode": "HTML"
                         },
                         timeout=8
                     )
@@ -740,7 +811,6 @@ def poll_telegram_commands(state, models):
                 elif data.startswith("set_"):
                     new_mins = int(data.split("_")[1])
                     state["interval_mins"] = new_mins
-                    # पहले तुरंत Telegram को जवाब दें ताकि Loading तुरंत बंद हो
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
                         data={"callback_query_id": cb_id, "text": f"✅ Interval set to {format_interval(new_mins)}!"},
@@ -767,7 +837,7 @@ def poll_telegram_commands(state, models):
                     )
                     ok = execute_news_post(state, models, force=True)
                     send_or_edit_panel(chat_id, state, msg_id)
-                    status_msg = "✅ Top news posted to channel!" if ok else "⚠️ कोई नई न्यूज़ नहीं मिली या इमेज लोड नहीं हुई।"
+                    status_msg = "✅ Top news posted to channel!" if ok else "⚠️ कोई नई न्यूज़ नहीं मिली।"
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                         data={"chat_id": chat_id, "text": status_msg},
