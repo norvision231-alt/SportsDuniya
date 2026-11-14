@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
 BRAND_TAG = "@SportsDuniyaOfficial"
 CHANNEL_LINK = "https://t.me/SportsDuniyaOfficial"
@@ -51,16 +52,13 @@ def get_ist_now():
     return datetime.now(ist_tz)
 
 def check_secrets():
-    missing = []
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHANNEL_ID:
-        missing.append("TELEGRAM_CHANNEL_ID")
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
-    if missing:
-        print(f"ERROR: Missing GitHub Secrets: {', '.join(missing)}")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        print("ERROR: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID")
         sys.exit(1)
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        print("ERROR: Both GROQ_API_KEY and GEMINI_API_KEY are missing!")
+        sys.exit(1)
+    print(f"AI Engines Ready -> Groq: {'YES' if GROQ_API_KEY else 'NO'} | Gemini: {'YES' if GEMINI_API_KEY else 'NO'}")
 
 def sync_git_pull():
     os.system("git pull --rebase -X theirs origin main >/dev/null 2>&1 || true")
@@ -123,7 +121,9 @@ def score_entry(entry, index):
     return score
 
 def get_available_models():
-    models = ["gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+    models = ["gemini-flash-lite-latest", "gemini-3.8-flash"]
+    if not GEMINI_API_KEY:
+        return models
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
         resp = requests.get(url, timeout=15)
@@ -250,24 +250,52 @@ def generate_inshorts_summary(title, description, extra_text, models):
     News Summary: {description}
     Additional Context: {extra_text[:1200]}
     """
-    
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
-    for model_name in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            resp = requests.post(url, json=payload, timeout=40)
-            if resp.ok:
-                data = resp.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            time.sleep(3)
-        except Exception:
-            time.sleep(3)
+    # 1. सबसे पहले सुपर-फास्ट Free Groq AI (Llama-3.3-70B) का उपयोग करें
+    if GROQ_API_KEY:
+        for groq_model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+            try:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": groq_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.5
+                    },
+                    timeout=20
+                )
+                if resp.ok:
+                    data = resp.json()
+                    print(f"[AI SUCCESS] Generated via Groq ({groq_model})")
+                    return data["choices"][0]["message"]["content"].strip()
+                else:
+                    print(f"[GROQ WARN] {groq_model} status {resp.status_code}")
+            except Exception as e:
+                print(f"[GROQ ERROR] {groq_model}: {e}")
 
+    # 2. अगर Groq न चले तो Gemini इस्तेमाल करें
+    if GEMINI_API_KEY:
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        for model_name in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+            try:
+                resp = requests.post(url, json=payload, timeout=35)
+                if resp.ok:
+                    data = resp.json()
+                    print(f"[AI SUCCESS] Generated via Gemini ({model_name})")
+                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                time.sleep(2)
+            except Exception:
+                time.sleep(2)
+
+    print("[AI FALLBACK] Using direct smart summary")
     return fallback_inshorts_summary(title, description, extra_text)
 
 def post_to_telegram(image_url, summary_text, source_link=""):
-    # NDTV और अन्य साइट्स के 403 Forbidden को रोकने के लिए एडवांस्ड ब्राउज़र हेडर्स
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
@@ -424,12 +452,12 @@ def poll_telegram_commands(state, models):
     try:
         resp = requests.get(url, params={"offset": offset, "timeout": 10}, timeout=15)
         if not resp.ok:
+            time.sleep(5)
             return
         updates = resp.json().get("result", [])
         for upd in updates:
             state["last_update_id"] = upd["update_id"]
             
-            # 1. अगर यूज़र ने बटन दबाया (Callback Query)
             if "callback_query" in upd:
                 cb = upd["callback_query"]
                 data = cb.get("data", "")
@@ -461,7 +489,6 @@ def poll_telegram_commands(state, models):
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                                   data={"chat_id": chat_id, "text": status_msg})
 
-            # 2. अगर यूज़र ने टेक्स्ट कमांड भेजा (/start, /panel, /set 20m, /set 2h)
             elif "message" in upd and "text" in upd["message"]:
                 msg = upd["message"]
                 chat_id = msg["chat"]["id"]
@@ -485,17 +512,28 @@ def poll_telegram_commands(state, models):
                         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                                       data={"chat_id": chat_id, "text": "Usage: /set 30m or /set 2h"})
     except Exception:
-        pass
+        time.sleep(5)
 
 def run_cron_scheduler():
     check_secrets()
     models = get_available_models()
     state = load_state()
     start_ts = time.time()
+    last_log_ts = 0
 
     print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins")
     while (time.time() - start_ts) < 19500:
         execute_news_post(state, models, force=False)
+        
+        # हर 2 मिनट में लॉग में लाइव टाइमर दिखाएगा ताकि आपको पता रहे कि अगली पोस्ट में कितने मिनट बाकी हैं
+        if time.time() - last_log_ts > 120:
+            mins = int(state.get("interval_mins", 60))
+            last_ts = state.get("last_post_ts", 0)
+            elapsed = int((time.time() - last_ts) / 60) if last_ts else mins
+            rem = max(0, mins - elapsed)
+            print(f"[LIVE TIMER] IST: {get_ist_now().strftime('%I:%M %p')} | Last post: {elapsed}m ago | Next post in: {rem}m")
+            last_log_ts = time.time()
+
         poll_telegram_commands(state, models)
 
 if __name__ == "__main__":
