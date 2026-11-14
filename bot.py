@@ -1,6 +1,7 @@
 import os
 import sys
 import gc
+import re
 import time
 import html
 import json
@@ -68,31 +69,38 @@ def sync_git_push():
     os.system('git config --global user.name "github-actions[bot]"')
     os.system('git config --global user.email "github-actions[bot]@users.noreply.github.com"')
     os.system("git add posted_hashes.json")
-    os.system('git commit -m "Update posted news hashes" >/dev/null 2>&1 || true')
+    os.system('git commit -m "Update bot state & settings" >/dev/null 2>&1 || true')
     os.system("git pull --rebase -X theirs origin main >/dev/null 2>&1 || true")
     os.system("git push origin main >/dev/null 2>&1 || true")
 
 def load_state():
     sync_git_pull()
+    default_state = {
+        "hashes": [],
+        "titles": [],
+        "last_post_ts": 0,
+        "interval_mins": 60,
+        "night_pause": True,
+        "last_update_id": 0
+    }
     if os.path.exists(HASH_FILE):
         try:
             with open(HASH_FILE, "r") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    return {"hashes": data, "titles": [], "last_post_ts": 0}
-                if "last_post_ts" not in data:
-                    data["last_post_ts"] = 0
+                    default_state["hashes"] = data
+                    return default_state
+                for k, v in default_state.items():
+                    if k not in data:
+                        data[k] = v
                 return data
         except Exception:
             pass
-    return {"hashes": [], "titles": [], "last_post_ts": 0}
+    return default_state
 
-def save_state(url_hash, title, state):
-    state["hashes"].append(url_hash)
-    state["titles"].append(title.lower())
+def save_state(state):
     state["hashes"] = state["hashes"][-150:]
     state["titles"] = state["titles"][-100:]
-    state["last_post_ts"] = int(time.time())
     with open(HASH_FILE, "w") as f:
         json.dump(state, f)
     sync_git_push()
@@ -144,7 +152,10 @@ def get_article_data(entry, url):
         image_url = entry.media_thumbnail[0].get("url")
 
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
         resp = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(resp.text, "html.parser")
         
@@ -255,8 +266,13 @@ def generate_inshorts_summary(title, description, extra_text, models):
 
     return fallback_inshorts_summary(title, description, extra_text)
 
-def post_to_telegram(image_url, summary_text):
-    headers = {"User-Agent": "Mozilla/5.0"}
+def post_to_telegram(image_url, summary_text, source_link=""):
+    # NDTV और अन्य साइट्स के 403 Forbidden को रोकने के लिए एडवांस्ड ब्राउज़र हेडर्स
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": source_link if source_link else "https://www.google.com/"
+    }
     img_resp = requests.get(image_url, headers=headers, timeout=15)
     img_resp.raise_for_status()
     
@@ -301,21 +317,19 @@ def post_to_telegram(image_url, summary_text):
         return False
     return True
 
-def execute_hourly_job(models):
+def execute_news_post(state, models, force=False):
     ist_now = get_ist_now()
-    print(f"\n[CRON CHECK] IST Time: {ist_now.strftime('%Y-%m-%d %I:%M %p')}")
+    interval_mins = int(state.get("interval_mins", 60))
+    night_pause = state.get("night_pause", True)
 
-    # रात 12:00 AM से 4:00 AM IST तक ऑटो-स्लीप
-    if 0 <= ist_now.hour < 4:
-        print("[NIGHT MODE] 12 AM - 4 AM IST active. Skipping post.")
-        return
+    if not force:
+        if night_pause and (0 <= ist_now.hour < 4):
+            return False
+        elapsed_mins = (int(time.time()) - state.get("last_post_ts", 0)) / 60
+        if elapsed_mins < interval_mins:
+            return False
 
-    state = load_state()
-    elapsed_mins = (int(time.time()) - state.get("last_post_ts", 0)) / 60
-    if elapsed_mins < 52:
-        print(f"[WAIT] Last post was {int(elapsed_mins)} mins ago. Next post in {int(55 - elapsed_mins)} mins.")
-        return
-
+    print(f"\n[POST TRIGGERED] IST: {ist_now.strftime('%I:%M %p')} | Interval: {interval_mins}m | Force: {force}")
     candidates = []
     for feed_url in RSS_FEEDS:
         feed = feedparser.parse(feed_url)
@@ -340,27 +354,149 @@ def execute_hourly_job(models):
         try:
             print(f"[POSTING] Score {score}: {title}")
             summary = generate_inshorts_summary(title, entry.get("summary", ""), extra_text, models)
-            if post_to_telegram(image_url, summary):
-                save_state(url_hash, title, state)
+            if post_to_telegram(image_url, summary, link):
+                state["hashes"].append(url_hash)
+                state["titles"].append(title.lower())
+                state["last_post_ts"] = int(time.time())
+                save_state(state)
                 del summary, extra_text, image_url
                 gc.collect()
-                print("[SUCCESS] News posted & hash synced to GitHub!")
-                return
+                print("[SUCCESS] News posted & synced to GitHub!")
+                return True
         except Exception as e:
             print(f"[RETRY] Failed '{title}': {e}")
             continue
+    return False
+
+def format_interval(mins):
+    if mins % 60 == 0 and mins >= 60:
+        hrs = mins // 60
+        return f"{hrs} Hour{'s' if hrs > 1 else ''} ({mins} mins)"
+    return f"{mins} Minutes"
+
+def build_control_panel(state):
+    mins = int(state.get("interval_mins", 60))
+    night = "ON (12 AM - 4 AM)" if state.get("night_pause", True) else "OFF (24x7 Active)"
+    last_ts = state.get("last_post_ts", 0)
+    elapsed = int((time.time() - last_ts) / 60) if last_ts else 0
+    remaining = max(0, mins - elapsed) if last_ts else 0
+
+    text = (
+        f"⚙️ <b>Sports Duniya Auto-Bot Control Panel</b>\n\n"
+        f"⏱️ <b>Current Interval:</b> {format_interval(mins)}\n"
+        f"🌙 <b>Night Pause:</b> {night}\n"
+        f"⏳ <b>Next Auto Post In:</b> ~{remaining} mins\n\n"
+        f"👇 <i>नीचे बटन दबाकर टाइम बदलें या कस्टम टाइम के लिए</i> <code>/set 25m</code> <i>या</i> <code>/set 2h</code> <i>भेजें:</i>"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "⚡ 15m", "callback_data": "set_15"},
+                {"text": "⏱️ 30m", "callback_data": "set_30"},
+                {"text": "⏱️ 45m", "callback_data": "set_45"}
+            ],
+            [
+                {"text": "🕐 1 Hr", "callback_data": "set_60"},
+                {"text": "🕑 2 Hrs", "callback_data": "set_120"},
+                {"text": "🕒 3 Hrs", "callback_data": "set_180"}
+            ],
+            [
+                {"text": "🚀 Post Now", "callback_data": "post_now"},
+                {"text": f"🌙 Night Pause: {'ON' if state.get('night_pause', True) else 'OFF'}", "callback_data": "toggle_night"}
+            ]
+        ]
+    }
+    return text, keyboard
+
+def send_or_edit_panel(chat_id, state, message_id=None):
+    text, keyboard = build_control_panel(state)
+    if message_id:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "reply_markup": json.dumps(keyboard)}
+    else:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": json.dumps(keyboard)}
+    requests.post(url, data=payload, timeout=10)
+
+def poll_telegram_commands(state, models):
+    offset = state.get("last_update_id", 0) + 1
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, params={"offset": offset, "timeout": 10}, timeout=15)
+        if not resp.ok:
+            return
+        updates = resp.json().get("result", [])
+        for upd in updates:
+            state["last_update_id"] = upd["update_id"]
+            
+            # 1. अगर यूज़र ने बटन दबाया (Callback Query)
+            if "callback_query" in upd:
+                cb = upd["callback_query"]
+                data = cb.get("data", "")
+                chat_id = cb["message"]["chat"]["id"]
+                msg_id = cb["message"]["message_id"]
+                cb_id = cb["id"]
+
+                if data.startswith("set_"):
+                    new_mins = int(data.split("_")[1])
+                    state["interval_mins"] = new_mins
+                    save_state(state)
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                  data={"callback_query_id": cb_id, "text": f"✅ Interval set to {format_interval(new_mins)}!"})
+                    send_or_edit_panel(chat_id, state, msg_id)
+
+                elif data == "toggle_night":
+                    state["night_pause"] = not state.get("night_pause", True)
+                    save_state(state)
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                  data={"callback_query_id": cb_id, "text": "✅ Night mode updated!"})
+                    send_or_edit_panel(chat_id, state, msg_id)
+
+                elif data == "post_now":
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                  data={"callback_query_id": cb_id, "text": "🚀 Sending top news to channel..."})
+                    ok = execute_news_post(state, models, force=True)
+                    send_or_edit_panel(chat_id, state, msg_id)
+                    status_msg = "✅ Top news posted to channel!" if ok else "⚠️ Failed to post news."
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                  data={"chat_id": chat_id, "text": status_msg})
+
+            # 2. अगर यूज़र ने टेक्स्ट कमांड भेजा (/start, /panel, /set 20m, /set 2h)
+            elif "message" in upd and "text" in upd["message"]:
+                msg = upd["message"]
+                chat_id = msg["chat"]["id"]
+                text = msg["text"].strip().lower()
+
+                if text in ["/start", "/panel", "/settings", "/status", "panel", "menu"]:
+                    save_state(state)
+                    send_or_edit_panel(chat_id, state)
+
+                elif text.startswith("/set"):
+                    m = re.search(r"(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?", text)
+                    if m:
+                        val = int(m.group(1))
+                        unit = m.group(2) or "m"
+                        mins = val * 60 if unit.startswith("h") else val
+                        mins = max(5, min(1440, mins))
+                        state["interval_mins"] = mins
+                        save_state(state)
+                        send_or_edit_panel(chat_id, state)
+                    else:
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                      data={"chat_id": chat_id, "text": "Usage: /set 30m or /set 2h"})
+    except Exception:
+        pass
 
 def run_cron_scheduler():
-    """यह इन-बिल्ट क्रॉन इंजन हर 1 घंटे में अपने आप न्यूज़ पोस्ट करता रहेगा"""
     check_secrets()
     models = get_available_models()
+    state = load_state()
     start_ts = time.time()
 
-    # 5.5 घंटे का नॉन-स्टॉप क्रॉन लूप (खत्म होते ही GitHub अगला लूप शुरू कर देगा)
+    print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins")
     while (time.time() - start_ts) < 19500:
-        execute_hourly_job(models)
-        print("[CRON SLEEP] Waiting 15 minutes for next time check...")
-        time.sleep(900)
+        execute_news_post(state, models, force=False)
+        poll_telegram_commands(state, models)
 
 if __name__ == "__main__":
     run_cron_scheduler()
