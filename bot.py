@@ -6,6 +6,7 @@ import time
 import html
 import json
 import hashlib
+import threading
 import requests
 import feedparser
 from io import BytesIO
@@ -45,7 +46,7 @@ PRIORITY_KEYWORDS = [
     "praggnanandhaa", "hockey", "neeraj chopra", "f1", "final", "record", "breaking", "win"
 ]
 
-# Top 20 Indian & Global Languages for Group Members
+# Top 20 Indian & International Languages for Linked Group Members
 TOP_20_LANGUAGES = {
     "hi": ("🇮🇳 हिंदी", "Simple, natural Hindi (Devanagari script)"),
     "hinglish": ("🔥 Hinglish", "Conversational Hinglish (Hindi in English alphabet)"),
@@ -69,11 +70,10 @@ TOP_20_LANGUAGES = {
     "ar": ("🇸🇦 العربية", "Natural Arabic")
 }
 
-# RAM Cache for Post Text & Translations so repeated clicks are instant (0 API cost)
 POST_SOURCE_TEXT = {}
 TRANSLATION_CACHE = {}
-
 HASH_FILE = "posted_hashes.json"
+git_lock = threading.Lock()
 
 def get_ist_now():
     ist_tz = timezone(timedelta(hours=5, minutes=30))
@@ -86,18 +86,40 @@ def check_secrets():
     if not GROQ_API_KEY and not GEMINI_API_KEY:
         print("ERROR: Both GROQ_API_KEY and GEMINI_API_KEY are missing!")
         sys.exit(1)
+    # किसी पुराने Webhook को हटाएं ताकि getUpdates कभी न अटके
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            data={"drop_pending_updates": False},
+            timeout=10
+        )
+    except Exception:
+        pass
     print(f"AI Engines Ready -> Groq: {'YES' if GROQ_API_KEY else 'NO'} | Gemini: {'YES' if GEMINI_API_KEY else 'NO'}")
 
 def sync_git_pull():
     os.system("git pull --rebase -X theirs origin main >/dev/null 2>&1 || true")
 
-def sync_git_push():
-    os.system('git config --global user.name "github-actions[bot]"')
-    os.system('git config --global user.email "github-actions[bot]@users.noreply.github.com"')
-    os.system("git add posted_hashes.json")
-    os.system('git commit -m "Update bot state & settings" >/dev/null 2>&1 || true')
-    os.system("git pull --rebase -X theirs origin main >/dev/null 2>&1 || true")
-    os.system("git push origin main >/dev/null 2>&1 || true")
+def _background_git_push():
+    with git_lock:
+        os.system('git config --global user.name "github-actions[bot]"')
+        os.system('git config --global user.email "github-actions[bot]@users.noreply.github.com"')
+        os.system("git add posted_hashes.json")
+        os.system('git commit -m "Update bot state & settings" >/dev/null 2>&1 || true')
+        os.system("git pull --rebase -X theirs origin main >/dev/null 2>&1 || true")
+        os.system("git push origin main >/dev/null 2>&1 || true")
+
+def save_state(state, push_to_git=False):
+    """तुरंत 1ms में लोकल फाइल सेव करता है और Git Push बैकग्राउंड थ्रेड में चलाता है ताकि बॉट कभी हैंग न हो"""
+    state["hashes"] = state["hashes"][-150:]
+    state["titles"] = state["titles"][-100:]
+    try:
+        with open(HASH_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+    if push_to_git:
+        threading.Thread(target=_background_git_push, daemon=True).start()
 
 def load_state():
     sync_git_pull()
@@ -125,13 +147,6 @@ def load_state():
             pass
     return default_state
 
-def save_state(state):
-    state["hashes"] = state["hashes"][-150:]
-    state["titles"] = state["titles"][-100:]
-    with open(HASH_FILE, "w") as f:
-        json.dump(state, f)
-    sync_git_push()
-
 def is_duplicate(url_hash, title, state):
     if url_hash in state["hashes"]:
         return True
@@ -150,12 +165,12 @@ def score_entry(entry, index):
     return score
 
 def get_available_models():
-    models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest"]
+    models = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
     if not GEMINI_API_KEY:
         return models
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
-        resp = requests.get(url, timeout=12)
+        resp = requests.get(url, timeout=10)
         if resp.ok:
             discovered = []
             for m in resp.json().get("models", []):
@@ -164,15 +179,14 @@ def get_available_models():
                 if "generateContent" in methods and any(k in name for k in ["flash", "gemma"]):
                     if not any(bad in name for bad in ["tts", "image", "audio", "vision", "embedding"]):
                         discovered.append(name)
-            discovered.sort(key=lambda x: (0 if "3.8" in x else (1 if "lite" in x else 2)))
             if discovered:
                 models = list(dict.fromkeys(["gemini-3.8-flash"] + discovered))[:5]
     except Exception:
         pass
     return models
 
-def call_ai_text(prompt, models, max_tokens=600):
-    """Groq + Gemini 3.8 Flash Dual Engine Call"""
+def call_ai_text(prompt, models, max_tokens=500):
+    """Groq + Gemini 3.8 Flash Fast Dual Engine"""
     if GROQ_API_KEY:
         for groq_model in [
             "llama-3.3-70b-versatile",
@@ -192,7 +206,7 @@ def call_ai_text(prompt, models, max_tokens=600):
                         "max_tokens": max_tokens,
                         "temperature": 0.4
                     },
-                    timeout=18
+                    timeout=15
                 )
                 if resp.ok:
                     return resp.json()["choices"][0]["message"]["content"].strip()
@@ -204,7 +218,7 @@ def call_ai_text(prompt, models, max_tokens=600):
         for model_name in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
             try:
-                resp = requests.post(url, json=payload, timeout=25)
+                resp = requests.post(url, json=payload, timeout=20)
                 if resp.ok:
                     return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
             except Exception:
@@ -225,7 +239,7 @@ def get_article_data(entry, url):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(resp.text, "html.parser")
 
         if not image_url:
@@ -325,7 +339,7 @@ def generate_inshorts_summary(title, description, extra_text, models):
     return fallback_inshorts_summary(title, description, extra_text)
 
 # =========================================================
-# MAIN CHANNEL POST (NO INLINE BUTTON -> ENABLES COMMENTS!)
+# MAIN CHANNEL POST (NO INLINE BUTTON -> CLEAN POST + COMMENTS)
 # =========================================================
 def post_to_telegram(image_url, summary_text, source_link=""):
     headers = {
@@ -333,7 +347,7 @@ def post_to_telegram(image_url, summary_text, source_link=""):
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Referer": source_link if source_link else "https://www.google.com/"
     }
-    img_resp = requests.get(image_url, headers=headers, timeout=15)
+    img_resp = requests.get(image_url, headers=headers, timeout=12)
     img_resp.raise_for_status()
 
     branded_buffer = watermark_image_in_ram(img_resp.content)
@@ -350,7 +364,6 @@ def post_to_telegram(image_url, summary_text, source_link=""):
 
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": branded_buffer}
-    # Inline button removed so channel posts look clean & Telegram's native Comments button works!
     data = {
         "chat_id": TELEGRAM_CHANNEL_ID,
         "caption": caption[:1024],
@@ -373,7 +386,7 @@ def post_to_telegram(image_url, summary_text, source_link=""):
 # LINKED GROUP AUTO-HINDI + PERSONAL TOP-20 LANGUAGE SYSTEM
 # =========================================================
 def translate_sports_post(raw_text, lang_code, models, short_for_popup=False):
-    cache_key = f"{hashlib.md5(raw_text.encode('utf-8')).hexdigest()[:10]}_{lang_code}_{' pop' if short_for_popup else 'full'}"
+    cache_key = f"{hashlib.md5(raw_text.encode('utf-8')).hexdigest()[:10]}_{lang_code}_{'pop' if short_for_popup else 'full'}"
     if cache_key in TRANSLATION_CACHE:
         return TRANSLATION_CACHE[cache_key]
 
@@ -429,14 +442,12 @@ def build_top_20_language_keyboard(source_msg_id=0):
     return {"inline_keyboard": rows}
 
 def handle_linked_channel_post_in_group(msg, models):
-    """जब मुख्य चैनल की इंग्लिश पोस्ट Linked Group में ऑटो-फॉरवर्ड हो, तो तुरंत हिंदी में रिप्लाई करें"""
     chat_id = msg["chat"]["id"]
     msg_id = msg["message_id"]
     raw_text = (msg.get("caption") or msg.get("text") or "").strip()
     if len(raw_text) < 20:
         return
 
-    # ब्रांड टैग और हैशटैग हटाकर साफ टेक्स्ट सेव करें
     clean_lines = [
         line for line in raw_text.split("\n")
         if not line.strip().startswith("#") and BRAND_TAG not in line
@@ -452,7 +463,7 @@ def handle_linked_channel_post_in_group(msg, models):
     reply_html = (
         f"🇮🇳 <b>{headline}</b>\n\n"
         f"{body}\n\n"
-        f"<i>💡 अपनी पसंदीदा भाषा (Top 20) में अकेले पढ़ने के लिए नीचे क्लिक करें या /settings लिखें:</i>"
+        f"<i>💡 अपनी भाषा (Top 20) में अकेले पढ़ने के लिए नीचे क्लिक करें या /settings लिखें:</i>"
     )
 
     requests.post(
@@ -481,18 +492,28 @@ def execute_news_post(state, models, force=False):
 
     print(f"\n[POST TRIGGERED] IST: {ist_now.strftime('%I:%M %p')} | Interval: {interval_mins}m | Force: {force}")
     candidates = []
+    req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
+
+    # 8-Second Strict Timeout per RSS Feed so feedparser NEVER hangs the bot!
     for feed_url in RSS_FEEDS:
-        feed = feedparser.parse(feed_url)
-        for idx, entry in enumerate(feed.entries[:15]):
-            link = entry.get("link", "")
-            title = entry.get("title", "")
-            if not link or not title:
+        try:
+            r = requests.get(feed_url, headers=req_headers, timeout=8)
+            if not r.ok:
                 continue
-            url_hash = hashlib.md5(link.encode("utf-8")).hexdigest()
-            if is_duplicate(url_hash, title, state):
-                continue
-            score = score_entry(entry, idx)
-            candidates.append((score, entry, link, url_hash, title))
+            feed = feedparser.parse(r.content)
+            for idx, entry in enumerate(feed.entries[:15]):
+                link = entry.get("link", "")
+                title = entry.get("title", "")
+                if not link or not title:
+                    continue
+                url_hash = hashlib.md5(link.encode("utf-8")).hexdigest()
+                if is_duplicate(url_hash, title, state):
+                    continue
+                score = score_entry(entry, idx)
+                candidates.append((score, entry, link, url_hash, title))
+        except Exception as e:
+            print(f"[RSS SKIP] {feed_url}: {e}")
+            continue
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     print(f"[SCAN] Found {len(candidates)} fresh news items.")
@@ -508,10 +529,10 @@ def execute_news_post(state, models, force=False):
                 state["hashes"].append(url_hash)
                 state["titles"].append(title.lower())
                 state["last_post_ts"] = int(time.time())
-                save_state(state)
+                save_state(state, push_to_git=True)
                 del summary, extra_text, image_url
                 gc.collect()
-                print("[SUCCESS] News posted & synced to GitHub!")
+                print("[SUCCESS] News posted & synced to GitHub in background!")
                 return True
         except Exception as e:
             print(f"[RETRY] Failed '{title}': {e}")
@@ -536,7 +557,7 @@ def build_control_panel(state):
         f"⏱️ <b>Current Interval:</b> {format_interval(mins)}\n"
         f"🌙 <b>Night Pause:</b> {night}\n"
         f"⏳ <b>Next Auto Post In:</b> ~{remaining} mins\n"
-        f"🌐 <b>Linked Group Auto-Hindi + 20 Langs:</b> ACTIVE 🟢\n\n"
+        f"🌐 <b>Linked Group Auto-Hindi + Top 20 Langs:</b> ON 🟢\n\n"
         f"👇 <i>नीचे बटन दबाकर टाइम बदलें या कस्टम टाइम के लिए</i> <code>/set 25m</code> <i>या</i> <code>/set 2h</code> <i>भेजें:</i>"
     )
     keyboard = {
@@ -573,15 +594,18 @@ def poll_telegram_commands(state, models):
     offset = state.get("last_update_id", 0) + 1
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
-        resp = requests.get(url, params={"offset": offset, "timeout": 10}, timeout=15)
+        resp = requests.get(url, params={"offset": offset, "timeout": 8}, timeout=12)
         if not resp.ok:
-            time.sleep(5)
+            time.sleep(3)
             return
         updates = resp.json().get("result", [])
+        if not updates:
+            return
+
         for upd in updates:
             state["last_update_id"] = upd["update_id"]
+            save_state(state, push_to_git=False)
 
-            # 1. Handle Button Clicks (Callback Queries)
             if "callback_query" in upd:
                 cb = upd["callback_query"]
                 data = cb.get("data", "")
@@ -591,12 +615,10 @@ def poll_telegram_commands(state, models):
                 user_name = cb["from"].get("first_name", "Member")
                 cb_id = cb["id"]
 
-                # User clicked "🌐 मेरी भाषा में पढ़ें (Only Me)"
                 if data.startswith("mytr_"):
                     src_id = data.split("_")[1]
                     user_lang = state.get("user_langs", {}).get(user_id)
 
-                    # अगर यूज़र ने अभी तक भाषा नहीं चुनी है, तो उसे भाषा चुनने को कहें
                     if not user_lang:
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
@@ -604,11 +626,11 @@ def poll_telegram_commands(state, models):
                                 "callback_query_id": cb_id,
                                 "text": "⚙️ कृपया पहले पास वाले '⚙️ Language (Top 20)' बटन पर क्लिक करके अपनी भाषा चुनें (या ग्रुप में /settings लिखें)!",
                                 "show_alert": True
-                            }
+                            },
+                            timeout=8
                         )
                         continue
 
-                    # मूल टेक्स्ट निकालें
                     raw_src = POST_SOURCE_TEXT.get(src_id)
                     if not raw_src and "reply_to_message" in cb["message"]:
                         rep = cb["message"]["reply_to_message"]
@@ -619,36 +641,25 @@ def poll_telegram_commands(state, models):
                     lang_label, _ = TOP_20_LANGUAGES.get(user_lang, TOP_20_LANGUAGES["hi"])
                     popup_tr = translate_sports_post(raw_src, user_lang, models, short_for_popup=True)
 
-                    # 1. Private Screen Pop-up (केवल क्लिक करने वाले यूज़र को उसकी स्क्रीन पर दिखेगा!)
+                    # Private Popup Alert (केवल क्लिक करने वाले मेंबर को दिखेगा!)
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
                         data={
                             "callback_query_id": cb_id,
                             "text": f"{lang_label}:\n{popup_tr}"[:198],
                             "show_alert": True
-                        }
-                    )
-
-                    # 2. साथ ही पूरा विस्तृत अनुवाद उस यूज़र के Private DM में भी भेज दें (अगर उसने बॉट स्टार्ट किया है)
-                    full_tr = translate_sports_post(raw_src, user_lang, models, short_for_popup=False)
-                    requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        data={
-                            "chat_id": user_id,
-                            "text": f"🌐 <b>{lang_label} Translation:</b>\n\n{html.escape(full_tr)}\n\n⚡ <b>{BRAND_TAG}</b>",
-                            "parse_mode": "HTML"
                         },
                         timeout=8
                     )
 
-                # User clicked "⚙️ Language (Top 20)"
                 elif data.startswith("langmenu_"):
                     src_id = data.split("_")[1]
                     curr_code = state.get("user_langs", {}).get(user_id, "hi")
                     curr_label, _ = TOP_20_LANGUAGES.get(curr_code, TOP_20_LANGUAGES["hi"])
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                        data={"callback_query_id": cb_id, "text": f"आपकी वर्तमान भाषा: {curr_label} — नीचे से अपनी भाषा चुनें:"}
+                        data={"callback_query_id": cb_id, "text": f"आपकी वर्तमान भाषा: {curr_label}"},
+                        timeout=8
                     )
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
@@ -657,10 +668,9 @@ def poll_telegram_commands(state, models):
                             "message_id": msg_id,
                             "reply_markup": json.dumps(build_top_20_language_keyboard(src_id))
                         },
-                        timeout=10
+                        timeout=8
                     )
 
-                # User selected one of the Top 20 Languages
                 elif data.startswith("setlang_"):
                     parts = data.split("_")
                     chosen_code = parts[1]
@@ -669,9 +679,9 @@ def poll_telegram_commands(state, models):
                     if "user_langs" not in state:
                         state["user_langs"] = {}
                     state["user_langs"][user_id] = chosen_code
+                    save_state(state, push_to_git=True)
                     lang_label, _ = TOP_20_LANGUAGES.get(chosen_code, TOP_20_LANGUAGES["hi"])
 
-                    # अगर यह किसी पोस्ट के नीचे से चुना गया है, तो तुरंत उसी भाषा में Private Pop-up भी दिखा दें और बटन वापस छोटा कर दें
                     if src_id != "0":
                         raw_src = POST_SOURCE_TEXT.get(src_id, "")
                         if not raw_src and "reply_to_message" in cb["message"]:
@@ -679,12 +689,12 @@ def poll_telegram_commands(state, models):
                             raw_src = (rep.get("caption") or rep.get("text") or "").strip()
 
                         popup_tr = translate_sports_post(raw_src, chosen_code, models, short_for_popup=True) if raw_src else ""
-                        alert_msg = f"✅ {user_name}, आपकी भाषा {lang_label} सेव हो गई!\n\n{popup_tr}"[:198]
+                        alert_msg = f"✅ {user_name}, आपकी भाषा {lang_label} सेट हो गई!\n\n{popup_tr}"[:198]
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                            data={"callback_query_id": cb_id, "text": alert_msg, "show_alert": True}
+                            data={"callback_query_id": cb_id, "text": alert_msg, "show_alert": True},
+                            timeout=8
                         )
-                        # मेनू को वापस साफ-सुथरे 2 बटन में बदल दें ताकि ग्रुप में किसी को दिक्कत न हो
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
                             data={
@@ -692,17 +702,17 @@ def poll_telegram_commands(state, models):
                                 "message_id": msg_id,
                                 "reply_markup": json.dumps(build_group_translation_keyboard(src_id))
                             },
-                            timeout=10
+                            timeout=8
                         )
                     else:
-                        # अगर `/settings` कमांड से खोला गया था, तो पॉप-अप दिखाकर सेटिंग्स मैसेज को ग्रुप से डिलीट कर दें
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
                             data={
                                 "callback_query_id": cb_id,
-                                "text": f"✅ {user_name}, आपकी भाषा '{lang_label}' सेट हो गई है! अब किसी भी पोस्ट के नीचे '🌐 मेरी भाषा में पढ़ें' दबाएं।",
+                                "text": f"✅ {user_name}, आपकी भाषा '{lang_label}' सेव हो गई! अब किसी भी पोस्ट के नीचे '🌐 मेरी भाषा में पढ़ें' दबाएं।",
                                 "show_alert": True
-                            }
+                            },
+                            timeout=8
                         )
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
@@ -713,48 +723,65 @@ def poll_telegram_commands(state, models):
                 elif data.startswith("closelang_"):
                     src_id = data.split("_")[1]
                     requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        data={"callback_query_id": cb_id},
+                        timeout=5
+                    )
+                    requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
                         data={
                             "chat_id": chat_id,
                             "message_id": msg_id,
                             "reply_markup": json.dumps(build_group_translation_keyboard(src_id))
                         },
-                        timeout=10
+                        timeout=8
                     )
 
                 elif data.startswith("set_"):
                     new_mins = int(data.split("_")[1])
                     state["interval_mins"] = new_mins
-                    save_state(state)
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                  data={"callback_query_id": cb_id, "text": f"✅ Interval set to {format_interval(new_mins)}!"})
+                    # पहले तुरंत Telegram को जवाब दें ताकि Loading तुरंत बंद हो
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        data={"callback_query_id": cb_id, "text": f"✅ Interval set to {format_interval(new_mins)}!"},
+                        timeout=8
+                    )
                     send_or_edit_panel(chat_id, state, msg_id)
+                    save_state(state, push_to_git=True)
 
                 elif data == "toggle_night":
                     state["night_pause"] = not state.get("night_pause", True)
-                    save_state(state)
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                  data={"callback_query_id": cb_id, "text": "✅ Night mode updated!"})
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        data={"callback_query_id": cb_id, "text": "✅ Night mode updated!"},
+                        timeout=8
+                    )
                     send_or_edit_panel(chat_id, state, msg_id)
+                    save_state(state, push_to_git=True)
 
                 elif data == "post_now":
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                  data={"callback_query_id": cb_id, "text": "🚀 Sending top news to channel..."})
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        data={"callback_query_id": cb_id, "text": "🚀 न्यूज़ तैयार होकर चैनल पर जा रही है..."},
+                        timeout=8
+                    )
                     ok = execute_news_post(state, models, force=True)
                     send_or_edit_panel(chat_id, state, msg_id)
-                    status_msg = "✅ Top news posted to channel!" if ok else "⚠️ Failed to post news."
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                                  data={"chat_id": chat_id, "text": status_msg})
+                    status_msg = "✅ Top news posted to channel!" if ok else "⚠️ कोई नई न्यूज़ नहीं मिली या इमेज लोड नहीं हुई।"
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        data={"chat_id": chat_id, "text": status_msg},
+                        timeout=8
+                    )
 
-            # 2. Handle Incoming Messages (Linked Channel Auto-Forwards & Commands)
             elif "message" in upd:
                 msg = upd["message"]
                 chat_id = msg["chat"]["id"]
                 chat_type = msg["chat"].get("type", "private")
 
-                # A. अगर Linked Channel का पोस्ट ग्रुप में ऑटो-फॉरवर्ड होकर आया है -> तुरंत हिंदी में रिप्लाई करें
+                # Linked Channel की इंग्लिश पोस्ट ग्रुप में आते ही ऑटो-हिंदी रिप्लाई
                 if msg.get("is_automatic_forward") or (msg.get("sender_chat", {}).get("type") == "channel" and chat_type in ["group", "supergroup"]):
-                    handle_linked_channel_post_in_group(msg, models)
+                    threading.Thread(target=handle_linked_channel_post_in_group, args=(msg, models), daemon=True).start()
                     continue
 
                 if "text" not in msg:
@@ -763,25 +790,27 @@ def poll_telegram_commands(state, models):
                 text = msg["text"].strip()
                 low_text = text.lower()
 
-                # B. ग्रुप या प्राइवेट में /settings या /lang कमांड -> Top 20 Languages चुनने का पैनल
+                # ग्रुप में /settings या /lang कमांड
                 if low_text.startswith("/settings") or low_text.startswith("/lang"):
+                    if chat_type == "private":
+                        send_or_edit_panel(chat_id, state)
+                        continue
+
                     user_id = str(msg.get("from", {}).get("id", ""))
                     user_name = html.escape(msg.get("from", {}).get("first_name", "Member"))
                     curr_code = state.get("user_langs", {}).get(user_id, "hi")
                     curr_label, _ = TOP_20_LANGUAGES.get(curr_code, TOP_20_LANGUAGES["hi"])
 
-                    # यूज़र के `/settings` कमांड मैसेज को डिलीट कर दें ताकि ग्रुप साफ रहे
-                    if chat_type != "private":
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
-                            data={"chat_id": chat_id, "message_id": msg["message_id"]},
-                            timeout=5
-                        )
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+                        data={"chat_id": chat_id, "message_id": msg["message_id"]},
+                        timeout=5
+                    )
 
                     lang_msg = (
                         f"🌐 <b>{user_name}, अपनी पसंदीदा भाषा चुनें (Top 20 Languages):</b>\n"
                         f"• आपकी वर्तमान भाषा: <b>{curr_label}</b>\n\n"
-                        f"<i>👇 नीचे अपनी भाषा पर क्लिक करें—इसके बाद किसी भी न्यूज़ के नीचे '🌐 मेरी भाषा में पढ़ें' दबाने पर वह खबर केवल आपको आपकी भाषा में दिखेगी!</i>"
+                        f"<i>👇 नीचे अपनी भाषा पर क्लिक करें—यह मेनू अपने आप हट जाएगा और पोस्ट केवल आपको आपकी भाषा में दिखेगी:</i>"
                     )
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -791,15 +820,13 @@ def poll_telegram_commands(state, models):
                             "parse_mode": "HTML",
                             "reply_markup": json.dumps(build_top_20_language_keyboard(0))
                         },
-                        timeout=10
+                        timeout=8
                     )
 
-                # C. एडमिन कंट्रोल पैनल (केवल Private Chat में)
-                elif chat_type == "private" and low_text in ["/start", "/panel", "/status", "panel", "menu"]:
-                    save_state(state)
+                elif low_text in ["/start", "/panel", "/status", "panel", "menu"]:
                     send_or_edit_panel(chat_id, state)
 
-                elif chat_type == "private" and low_text.startswith("/set"):
+                elif low_text.startswith("/set"):
                     m = re.search(r"(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?", low_text)
                     if m:
                         val = int(m.group(1))
@@ -807,10 +834,10 @@ def poll_telegram_commands(state, models):
                         mins = val * 60 if unit.startswith("h") else val
                         mins = max(5, min(1440, mins))
                         state["interval_mins"] = mins
-                        save_state(state)
                         send_or_edit_panel(chat_id, state)
+                        save_state(state, push_to_git=True)
     except Exception:
-        time.sleep(5)
+        time.sleep(3)
 
 def run_cron_scheduler():
     check_secrets()
@@ -819,7 +846,7 @@ def run_cron_scheduler():
     start_ts = time.time()
     last_log_ts = 0
 
-    print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins | Linked Group Translator: ON")
+    print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins | Non-Blocking Mode ON")
     while (time.time() - start_ts) < 19500:
         execute_news_post(state, models, force=False)
 
