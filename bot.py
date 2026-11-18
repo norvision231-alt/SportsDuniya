@@ -22,7 +22,10 @@ RAW_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
+# 👑 MASTER ADMIN & BRAND CONFIG
+ADMIN_ID = int((os.getenv("ADMIN_ID", "7412791600") or "7412791600").strip())
 BRAND_TAG = "@SportsDuniyaOfficial"
+SUBSCRIPTION_STARS = 55  # ~₹99 in Telegram Stars (XTR)
 
 if "t.me/" in RAW_CHANNEL_ID:
     RAW_CHANNEL_ID = "@" + RAW_CHANNEL_ID.split("t.me/")[-1].strip("/")
@@ -66,10 +69,17 @@ COMPETITOR_BRANDS = [
 
 HASH_FILE = "posted_hashes.json"
 git_lock = threading.Lock()
+user_input_states = {}  # Tracks step-by-step inputs (e.g. setting channel or brand tag)
 
 def get_ist_now():
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist_tz)
+
+def is_master(uid):
+    try:
+        return int(uid) == ADMIN_ID
+    except Exception:
+        return False
 
 def check_secrets():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
@@ -86,7 +96,7 @@ def check_secrets():
         )
     except Exception:
         pass
-    print(f"AI Engines Ready -> Groq: {'YES' if GROQ_API_KEY else 'NO'} | Gemini: {'YES' if GEMINI_API_KEY else 'NO'}")
+    print(f"AI Engines Ready -> Groq: {'YES' if GROQ_API_KEY else 'NO'} | Gemini: {'YES' if GEMINI_API_KEY else 'NO'} | Master Admin: {ADMIN_ID}")
 
 def sync_git_pull():
     os.system("git pull --rebase -X theirs origin main >/dev/null 2>&1 || true")
@@ -96,7 +106,7 @@ def _background_git_push():
         os.system('git config --global user.name "github-actions[bot]"')
         os.system('git config --global user.email "github-actions[bot]@users.noreply.github.com"')
         os.system("git add posted_hashes.json")
-        os.system('git commit -m "Update bot state & settings" >/dev/null 2>&1 || true')
+        os.system('git commit -m "Update bot state & client subscriptions" >/dev/null 2>&1 || true')
         os.system("git pull --rebase -X theirs origin main >/dev/null 2>&1 || true")
         os.system("git push origin main >/dev/null 2>&1 || true")
 
@@ -119,7 +129,8 @@ def load_state():
         "last_post_ts": 0,
         "interval_mins": 60,
         "night_pause": True,
-        "last_update_id": 0
+        "last_update_id": 0,
+        "clients": {}  # user_id -> {name, paid, expires_at, channel_id, brand_tag, active}
     }
     if os.path.exists(HASH_FILE):
         try:
@@ -135,6 +146,12 @@ def load_state():
         except Exception:
             pass
     return default_state
+
+def is_client_active_and_paid(client_obj):
+    if not client_obj or not client_obj.get("paid"):
+        return False
+    exp = float(client_obj.get("expires_at", 0))
+    return exp > time.time()
 
 def strip_links_and_brands(text):
     """बाहरी लिंक्स, रीडायरेक्ट, एरर कोड और दूसरी मीडिया कंपनियों के नाम को पूरी तरह हटाता है"""
@@ -223,7 +240,6 @@ def get_available_models():
     return models
 
 def extract_rss_image(entry):
-    """RSS एंट्री के अंदर मौजूद हर संभावित टैग से इमेज URL निकालता है"""
     if "media_content" in entry and entry.media_content:
         for mc in entry.media_content:
             if mc.get("url"):
@@ -284,7 +300,6 @@ def get_article_data(entry, url):
     return image_url, strip_links_and_brands(article_text)
 
 def search_bing_sports_image(query_title):
-    """अगर वेबसाइट (जैसे NDTV) ने फोटो ब्लॉक कर दी हो, तो Bing से उसी खबर की असली HD स्पोर्ट्स फोटो खोजता है"""
     clean_q = re.sub(r"[^\w\s]", " ", query_title)
     clean_q = " ".join(clean_q.split()[:9]) + " sports photo"
     search_url = f"https://www.bing.com/images/search?q={urllib.parse.quote(clean_q)}&qft=+filterui:imagesize-large"
@@ -303,7 +318,6 @@ def search_bing_sports_image(query_title):
     return []
 
 def validate_and_normalize_image(raw_bytes):
-    """फोटो को चेक करता है और छोटा होने पर 1280px चौड़ाई में साफ HD रिसाइज़ करता है"""
     try:
         with Image.open(BytesIO(raw_bytes)) as im:
             im = im.convert("RGB")
@@ -321,11 +335,9 @@ def validate_and_normalize_image(raw_bytes):
         return None
 
 def download_real_hd_image(image_url, title="", source_link=""):
-    """100% गारंटीड रियल स्पोर्ट्स इमेज डाउनलोडर (RSS + Proxy + Bing HD Search Fallback)"""
     candidate_urls = []
 
     if image_url:
-        # Upgrade BBC / NDTV low-res URLs to high-res
         upgraded = re.sub(r"/standard/\d+/", "/standard/1024/", image_url)
         clean_url = upgraded.split("?")[0] if "ndtvimg.com" in upgraded else upgraded
         encoded_clean = urllib.parse.quote(clean_url, safe="")
@@ -340,7 +352,6 @@ def download_real_hd_image(image_url, title="", source_link=""):
             upgraded
         ])
 
-    # Add Bing HD Sports Image Search results as automatic fallback
     if title:
         bing_urls = search_bing_sports_image(title)
         for b_url in bing_urls:
@@ -351,7 +362,7 @@ def download_real_hd_image(image_url, title="", source_link=""):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": "https://www.google.com/"
+        "Referer": source_link if source_link else "https://www.google.com/"
     }
 
     for try_url in candidate_urls:
@@ -365,8 +376,9 @@ def download_real_hd_image(image_url, title="", source_link=""):
             continue
     return None
 
-def watermark_image_in_ram(image_bytes):
-    """फोटो के अंदर @SportsDuniyaOfficial का प्रीमियम ब्रांडिंग टैग लगाता है"""
+def watermark_image_in_ram(image_bytes, custom_brand=None):
+    """फोटो के अंदर @SportsDuniyaOfficial या पेड क्लाइंट का कस्टम ब्रांड टैग लगाता है"""
+    tag_text = (custom_brand or BRAND_TAG).strip()
     with Image.open(BytesIO(image_bytes)) as img:
         img = img.convert("RGBA")
         width, height = img.size
@@ -387,7 +399,7 @@ def watermark_image_in_ram(image_bytes):
         if not font:
             font = ImageFont.load_default()
 
-        bbox = draw.textbbox((0, 0), BRAND_TAG, font=font)
+        bbox = draw.textbbox((0, 0), tag_text, font=font)
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
 
@@ -407,7 +419,7 @@ def watermark_image_in_ram(image_bytes):
             outline=(255, 195, 0, 240),
             width=max(1, int(font_size * 0.08))
         )
-        draw.text((box_x1 + pad_x, box_y1 + pad_y - bbox[1]), BRAND_TAG, font=font, fill=(255, 255, 255, 255))
+        draw.text((box_x1 + pad_x, box_y1 + pad_y - bbox[1]), tag_text, font=font, fill=(255, 255, 255, 255))
 
         combined = Image.alpha_composite(img, overlay).convert("RGB")
         out_buffer = BytesIO()
@@ -427,13 +439,14 @@ def parse_ai_json_response(raw_text):
         pass
     return None
 
-def build_structured_post(title, description, extra_text, models):
+def generate_structured_post_parts(title, description, extra_text, models):
+    """एक बार AI कॉल करके पोस्ट के 5 हिस्से बनाता है ताकि सभी चैनलों पर उनके अपने ब्रांड नाम से भेजा जा सके"""
     clean_title = strip_links_and_brands(title)
     clean_desc = strip_links_and_brands(description)
     clean_extra = strip_links_and_brands(extra_text)
 
     prompt = f"""
-    You are the Chief Sports Editor of '{BRAND_TAG}', a top-tier Inshorts-style Telegram sports channel.
+    You are the Chief Sports Editor of a top-tier Inshorts-style Telegram sports network.
     Write a 100% human-written, engaging, SEO-optimized English sports news post.
     If the input details are short, use your deep sports knowledge to add accurate context (player role, tournament importance, match situation, or key statistics) so the reader gets the complete story right here without needing any external link.
     STRICT RULE: Never mention any other media name (like NDTV, ESPN, BBC, Sky, PTI) and never include any URLs or links.
@@ -444,7 +457,7 @@ def build_structured_post(title, description, extra_text, models):
       "subheadline": "⚡ [Sharp 2nd-line sub-headline highlighting the key stat, score, or impact in 8 to 12 words]",
       "summary": "[Crisp Inshorts-style paragraph of strictly 55 to 65 words. Start with the biggest impact in sentence 1, followed by complete match/player context in natural human journalism style]",
       "question": "💬 [1-line engaging fan debate question ending with 'Drop your thoughts in the comments!']",
-      "hashtags": "[5 high-search organic SEO hashtags separated by spaces, e.g. #Cricket #MSDhoni #IPL #TeamIndia #SportsDuniya]"
+      "hashtags": "[4 high-search organic SEO hashtags separated by spaces, e.g. #Cricket #MSDhoni #IPL #TeamIndia]"
     }}
 
     Input Headline: {clean_title}
@@ -521,7 +534,7 @@ def build_structured_post(title, description, extra_text, models):
             "subheadline": "⚡ Key Developments & Match Impact Explained",
             "summary": body,
             "question": "💬 What's your take on this? Drop your thoughts in the comments!",
-            "hashtags": "#SportsNews #Cricket #Football #TrendingSports #SportsDuniya"
+            "hashtags": "#SportsNews #Cricket #Football #TrendingSports"
         }
 
     h1 = strip_links_and_brands(str(parsed.get("headline", ""))).replace("*", "").replace("#", "")
@@ -534,49 +547,65 @@ def build_structured_post(title, description, extra_text, models):
     if not question_line.startswith("💬"):
         question_line = f"💬 {question_line}"
 
-    raw_tags = str(parsed.get("hashtags", "#Cricket #Football #SportsNews #SportsDuniya"))
-    clean_tags = " ".join(re.findall(r"#\w+", raw_tags)) or "#Cricket #Football #SportsNews #SportsDuniya"
-    if "#sportsduniya" not in clean_tags.lower():
-        clean_tags += " #SportsDuniya"
+    raw_tags = str(parsed.get("hashtags", "#Cricket #Football #SportsNews"))
+    clean_tags = " ".join(re.findall(r"#\w+", raw_tags)) or "#Cricket #Football #SportsNews"
 
-    caption_html = (
-        f"<b>{html.escape(h1)}</b>\n"
-        f"<b>{html.escape(h2)}</b>\n\n"
-        f"{html.escape(summary_body)}\n\n"
-        f"<i>{html.escape(question_line)}</i>\n\n"
-        f"{html.escape(clean_tags)}\n"
-        f"⚡ <b>{BRAND_TAG}</b>"
+    return {
+        "h1": h1,
+        "h2": h2,
+        "summary": summary_body,
+        "question": question_line,
+        "tags": clean_tags
+    }
+
+def format_caption_for_brand(post_parts, custom_brand=None):
+    brand = (custom_brand or BRAND_TAG).strip()
+    brand_hashtag = "#" + re.sub(r"[^a-zA-Z0-9]", "", brand)
+    tags = post_parts["tags"]
+    if brand_hashtag.lower() not in tags.lower() and len(brand_hashtag) > 2:
+        tags = f"{tags} {brand_hashtag}"
+
+    return (
+        f"<b>{html.escape(post_parts['h1'])}</b>\n"
+        f"<b>{html.escape(post_parts['h2'])}</b>\n\n"
+        f"{html.escape(post_parts['summary'])}\n\n"
+        f"<i>{html.escape(post_parts['question'])}</i>\n\n"
+        f"{html.escape(tags)}\n"
+        f"⚡ <b>{html.escape(brand)}</b>"
     )
-    return caption_html
 
-def post_to_telegram_with_bytes(img_bytes, caption_html):
-    branded_buffer = watermark_image_in_ram(img_bytes)
+def send_branded_photo_to_channel(target_channel_id, raw_img_bytes, post_parts, custom_brand=None):
+    branded_buffer = watermark_image_in_ram(raw_img_bytes, custom_brand=custom_brand)
+    caption_html = format_caption_for_brand(post_parts, custom_brand=custom_brand)
 
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": branded_buffer}
     data = {
-        "chat_id": TELEGRAM_CHANNEL_ID,
+        "chat_id": target_channel_id,
         "caption": caption_html[:1024],
         "parse_mode": "HTML"
     }
 
-    res = requests.post(tg_url, data=data, files=files, timeout=20)
+    try:
+        res = requests.post(tg_url, data=data, files=files, timeout=20)
+        ok = res.ok
+        if not ok:
+            print(f"Telegram API Error for {target_channel_id} ({res.status_code}): {res.text}")
+    except Exception as e:
+        print(f"Send Error for {target_channel_id}: {e}")
+        ok = False
 
     branded_buffer.close()
     del branded_buffer
     gc.collect()
+    return ok
 
-    if not res.ok:
-        print(f"Telegram API Error ({res.status_code}): {res.text}")
-        return False
-    return True
-
-def execute_news_post(state, models, force=False):
+def execute_news_post(state, models, force=False, single_client_channel=None, single_client_brand=None):
     ist_now = get_ist_now()
     interval_mins = int(state.get("interval_mins", 60))
     night_pause = state.get("night_pause", True)
 
-    if not force:
+    if not force and not single_client_channel:
         if night_pause and (0 <= ist_now.hour < 4):
             return False
         elapsed_mins = (int(time.time()) - state.get("last_post_ts", 0)) / 60
@@ -585,7 +614,7 @@ def execute_news_post(state, models, force=False):
 
     print(f"\n[POST TRIGGERED] IST: {ist_now.strftime('%I:%M %p')} | Interval: {interval_mins}m | Force: {force}")
     raw_entries = []
-    seen_Batch_titles = []
+    seen_batch_titles = []
     word_counter = Counter()
     req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
 
@@ -601,12 +630,11 @@ def execute_news_post(state, models, force=False):
                 if not link or not title or len(title) < 15:
                     continue
                 url_hash = hashlib.md5(link.encode("utf-8")).hexdigest()
-                if is_duplicate(url_hash, title, state):
+                if not single_client_channel and is_duplicate(url_hash, title, state):
                     continue
-                # एक ही स्कैन में अलग-अलग फीड्स की डुप्लीकेट खबरें हटाएं
-                if any(SequenceMatcher(None, title.lower(), st).ratio() > 0.65 for st in seen_Batch_titles):
+                if any(SequenceMatcher(None, title.lower(), st).ratio() > 0.65 for st in seen_batch_titles):
                     continue
-                seen_Batch_titles.append(title.lower())
+                seen_batch_titles.append(title.lower())
 
                 words = [w for w in re.findall(r"[a-z]{4,}", title.lower()) if w not in {"with", "from", "that", "this", "after", "over", "into", "against"}]
                 word_counter.update(set(words))
@@ -628,22 +656,41 @@ def execute_news_post(state, models, force=False):
     for score, entry, link, url_hash, title in candidates[:12]:
         try:
             image_url, extra_text = get_article_data(entry, link)
-            # पहले असली HD फोटो डाउनलोड करें (RSS या Bing Sports Image Search से) ताकि AI कॉल कभी बेकार न जाए
             img_bytes = download_real_hd_image(image_url, title=title, source_link=link)
             if not img_bytes:
                 print(f"[IMAGE SKIP] Could not fetch image for: {title}")
                 continue
 
             print(f"[POSTING] Trending Score {score}: {title}")
-            caption_html = build_structured_post(title, entry.get("summary", ""), extra_text, models)
-            if post_to_telegram_with_bytes(img_bytes, caption_html):
+            post_parts = generate_structured_post_parts(title, entry.get("summary", ""), extra_text, models)
+
+            # A. If testing for a single paid client channel
+            if single_client_channel:
+                ok = send_branded_photo_to_channel(single_client_channel, img_bytes, post_parts, custom_brand=single_client_brand)
+                del img_bytes, post_parts
+                gc.collect()
+                return ok
+
+            # B. Post to Master Admin Channel (@SportsDuniyaOfficial)
+            master_ok = send_branded_photo_to_channel(TELEGRAM_CHANNEL_ID, img_bytes, post_parts, custom_brand=BRAND_TAG)
+
+            # C. Broadcast to all Active Paid Client Channels with THEIR Custom Watermark & Brand Tag!
+            clients_map = state.get("clients", {})
+            for cid_uid, c_info in clients_map.items():
+                if is_client_active_and_paid(c_info) and c_info.get("active", True) and c_info.get("channel_id"):
+                    c_chan = c_info["channel_id"]
+                    c_brand = c_info.get("brand_tag") or BRAND_TAG
+                    send_branded_photo_to_channel(c_chan, img_bytes, post_parts, custom_brand=c_brand)
+                    time.sleep(0.4)
+
+            if master_ok:
                 state["hashes"].append(url_hash)
                 state["titles"].append(title.lower())
                 state["last_post_ts"] = int(time.time())
                 save_state(state, push_to_git=True)
-                del caption_html, extra_text, img_bytes
+                del post_parts, extra_text, img_bytes
                 gc.collect()
-                print("[SUCCESS] Posted with HD Photo, 2-Line Heading & @SportsDuniyaOfficial watermark!")
+                print("[SUCCESS] Posted to Master Channel & all active Paid Client Channels!")
                 return True
         except Exception as e:
             print(f"[RETRY] Failed '{title}': {e}")
@@ -656,20 +703,45 @@ def format_interval(mins):
         return f"{hrs} Hour{'s' if hrs > 1 else ''} ({mins} mins)"
     return f"{mins} Minutes"
 
-def build_control_panel(state):
+# =========================================================
+# 👑 MASTER ADMIN PANEL vs 💎 PAID CLIENT SAAS PANEL
+# =========================================================
+def send_stars_subscription_invoice(chat_id, user_id):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendInvoice"
+    prices = [{"label": "₹99 Pro Custom Branding Plan (30 Days)", "amount": SUBSCRIPTION_STARS}]
+    payload = {
+        "chat_id": chat_id,
+        "title": "Sports Auto-News Bot (Pro Custom Branding)",
+        "description": "Activate 24/7 Automatic Trending Sports News in your channel with YOUR Custom Image Watermark & Brand Tag (₹99 / Stars Plan).",
+        "payload": f"sports_saas_{user_id}",
+        "provider_token": "",
+        "currency": "XTR",
+        "prices": json.dumps(prices)
+    }
+    requests.post(url, data=payload, timeout=10)
+
+def build_master_admin_panel(state):
     mins = int(state.get("interval_mins", 60))
     night = "ON (12 AM - 4 AM)" if state.get("night_pause", True) else "OFF (24x7 Active)"
     last_ts = state.get("last_post_ts", 0)
     elapsed = int((time.time() - last_ts) / 60) if last_ts else 0
     remaining = max(0, mins - elapsed) if last_ts else 0
 
+    clients = state.get("clients", {})
+    paid_count = sum(1 for c in clients.values() if is_client_active_and_paid(c))
+
     text = (
-        f"⚙️ <b>Sports Duniya Auto-Bot Control Panel</b>\n\n"
+        f"👑 <b>Sports Duniya Master Admin Panel</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"⏱️ <b>Current Interval:</b> {format_interval(mins)}\n"
         f"🌙 <b>Night Pause:</b> {night}\n"
         f"⏳ <b>Next Auto Post In:</b> ~{remaining} mins\n"
-        f"💬 <b>Format:</b> 2-Line Heading + Inshorts + Native Comments ON 🟢\n\n"
-        f"👇 <i>नीचे बटन दबाकर टाइम बदलें या कस्टम टाइम के लिए</i> <code>/set 25m</code> <i>या</i> <code>/set 2h</code> <i>भेजें:</i>"
+        f"💎 <b>Paid SaaS Clients:</b> {paid_count} Active (Total Users: {len(clients)})\n"
+        f"💰 <b>Client Price:</b> ₹99 ({SUBSCRIPTION_STARS} Telegram Stars)\n\n"
+        f"🛠 <b>Admin Commands:</b>\n"
+        f"• <code>/set 30m</code> or <code>/set 2h</code> — कस्टम टाइम सेट करें\n"
+        f"• <code>/grant USER_ID</code> — किसी यूज़र को 30 दिन का फ्री/UPI एक्सेस दें\n"
+        f"• <code>/revoke USER_ID</code> — किसी यूज़र का एक्सेस बंद करें"
     )
     keyboard = {
         "inline_keyboard": [
@@ -684,15 +756,81 @@ def build_control_panel(state):
                 {"text": "🕒 3 Hrs", "callback_data": "set_180"}
             ],
             [
-                {"text": "🚀 Post Now", "callback_data": "post_now"},
-                {"text": f"🌙 Night Pause: {'ON' if state.get('night_pause', True) else 'OFF'}", "callback_data": "toggle_night"}
+                {"text": "🚀 Post Now (All Channels)", "callback_data": "post_now"},
+                {"text": f"🌙 Night: {'ON' if state.get('night_pause', True) else 'OFF'}", "callback_data": "toggle_night"}
+            ],
+            [
+                {"text": f"👥 Manage Paid Clients ({paid_count})", "callback_data": "adm_clients"}
             ]
         ]
     }
     return text, keyboard
 
-def send_or_edit_panel(chat_id, state, message_id=None):
-    text, keyboard = build_control_panel(state)
+def build_client_saas_panel(user_id, user_name, state):
+    uid = str(user_id)
+    clients = state.get("clients", {})
+    if uid not in clients:
+        clients[uid] = {
+            "name": user_name,
+            "paid": False,
+            "expires_at": 0,
+            "channel_id": "",
+            "brand_tag": "",
+            "active": True
+        }
+    c = clients[uid]
+    is_paid = is_client_active_and_paid(c)
+    days_left = max(0, int((float(c.get("expires_at", 0)) - time.time()) / 86400)) if is_paid else 0
+    chan = c.get("channel_id") or "Not Set ❌"
+    brand = c.get("brand_tag") or "Not Set ❌"
+    status_line = f"🟢 <b>PRO ACTIVE ({days_left} Days Left)</b>" if is_paid else "🔒 <b>LOCKED (Pay ₹99 Stars to Activate)</b>"
+
+    text = (
+        f"🚀 <b>Sports Auto-News Bot (Custom Branding SaaS)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>User:</b> {html.escape(user_name)} (ID: <code>{uid}</code>)\n"
+        f"💳 <b>Plan Status:</b> {status_line}\n"
+        f"📢 <b>Your Channel:</b> <code>{html.escape(str(chan))}</code>\n"
+        f"🏷️ <b>Your Brand Watermark:</b> <code>{html.escape(str(brand))}</code>\n\n"
+        f"✨ <b>Features You Get (₹99 / Month):</b>\n"
+        f"• 24/7 Automatic Trending Sports News (Inshorts Style)\n"
+        f"• <b>YOUR Custom Brand Watermark</b> on every HD Photo\n"
+        f"• <b>YOUR Custom Tag</b> at the bottom of every post\n"
+        f"• 100% Clean SEO English Posts with Zero External Links!"
+    )
+
+    if not is_paid:
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": f"⭐ Pay ₹99 ({SUBSCRIPTION_STARS} Stars) — Instant Unlock", "callback_data": "client_buy"}],
+                [{"text": "🔄 Refresh Status", "callback_data": "client_home"}]
+            ]
+        }
+    else:
+        tog_label = "⏸️ Pause Auto-Posting" if c.get("active", True) else "▶️ Resume Auto-Posting"
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📢 Set My Channel", "callback_data": "client_set_chan"},
+                    {"text": "🏷️ Set My Brand Tag", "callback_data": "client_set_brand"}
+                ],
+                [
+                    {"text": "🧪 Send Test Post Now", "callback_data": "client_test_post"},
+                    {"text": tog_label, "callback_data": "client_toggle"}
+                ],
+                [
+                    {"text": f"⭐ Extend +30 Days (₹99 / {SUBSCRIPTION_STARS} Stars)", "callback_data": "client_buy"}
+                ]
+            ]
+        }
+    return text, keyboard
+
+def send_or_edit_panel(chat_id, user_id, user_name, state, message_id=None):
+    if is_master(user_id):
+        text, keyboard = build_master_admin_panel(state)
+    else:
+        text, keyboard = build_client_saas_panel(user_id, user_name, state)
+
     if message_id:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
         payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "reply_markup": json.dumps(keyboard)}
@@ -717,14 +855,133 @@ def poll_telegram_commands(state, models):
             state["last_update_id"] = upd["update_id"]
             save_state(state, push_to_git=False)
 
+            # 1. Handle Telegram Stars Pre-Checkout Query (Must answer within 10s)
+            if "pre_checkout_query" in upd:
+                pcq = upd["pre_checkout_query"]
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerPreCheckoutQuery",
+                    data={"pre_checkout_query_id": pcq["id"], "ok": True},
+                    timeout=8
+                )
+                continue
+
+            # 2. Handle Button Clicks
             if "callback_query" in upd:
                 cb = upd["callback_query"]
                 data = cb.get("data", "")
                 chat_id = cb["message"]["chat"]["id"]
                 msg_id = cb["message"]["message_id"]
+                uid = cb["from"]["id"]
+                uname = cb["from"].get("first_name", "User")
                 cb_id = cb["id"]
 
-                if data.startswith("set_"):
+                # --- CLIENT SAAS BUTTONS ---
+                if data == "client_home":
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cb_id}, timeout=5)
+                    send_or_edit_panel(chat_id, uid, uname, state, msg_id)
+                    continue
+
+                if data == "client_buy":
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        data={"callback_query_id": cb_id, "text": "💎 Sending ₹99 Telegram Stars Invoice..."},
+                        timeout=5
+                    )
+                    send_stars_subscription_invoice(chat_id, uid)
+                    continue
+
+                if data in ["client_set_chan", "client_set_brand", "client_test_post", "client_toggle"]:
+                    c_obj = state.get("clients", {}).get(str(uid))
+                    if not is_client_active_and_paid(c_obj) and not is_master(uid):
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                            data={"callback_query_id": cb_id, "text": "🔒 कृपया पहले ₹99 Stars पेमेंट करके अपना अकाउंट एक्टिवेट करें!", "show_alert": True},
+                            timeout=6
+                        )
+                        continue
+
+                    if data == "client_set_chan":
+                        user_input_states[str(uid)] = "SET_CHAN"
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cb_id}, timeout=5)
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            data={
+                                "chat_id": chat_id,
+                                "text": "📢 <b>Step 1:</b> सबसे पहले इस बॉट को अपने Telegram Channel में <b>Admin (Post Messages)</b> बनाएं।\n\n<b>Step 2:</b> अब अपने चैनल का <code>@username</code> (जैसे <code>@MySportsChannel</code>) या Channel ID (<code>-100...</code>) नीचे लिखकर भेजें (रद्द करने के लिए /cancel लिखें):",
+                                "parse_mode": "HTML"
+                            },
+                            timeout=8
+                        )
+                    elif data == "client_set_brand":
+                        user_input_states[str(uid)] = "SET_BRAND"
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cb_id}, timeout=5)
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            data={
+                                "chat_id": chat_id,
+                                "text": "🏷️ <b>अपना कस्टम ब्रांड नाम या टैग लिखकर भेजें:</b>\n(जैसे: <code>@MyCricketOfficial</code> या <code>Cricket Hub</code>)\n\nयही नाम आपकी हर फोटो के ऊपर Watermark में और पोस्ट के नीचे छपेगा:",
+                                "parse_mode": "HTML"
+                            },
+                            timeout=8
+                        )
+                    elif data == "client_toggle":
+                        c_obj["active"] = not c_obj.get("active", True)
+                        save_state(state, push_to_git=True)
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cb_id, "text": "✅ Status Updated!"}, timeout=5)
+                        send_or_edit_panel(chat_id, uid, uname, state, msg_id)
+                    elif data == "client_test_post":
+                        if not c_obj.get("channel_id"):
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                data={"callback_query_id": cb_id, "text": "⚠️ कृपया पहले '📢 Set My Channel' दबाकर अपना चैनल सेट करें!", "show_alert": True},
+                                timeout=6
+                            )
+                            continue
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                            data={"callback_query_id": cb_id, "text": "🚀 आपके कस्टम वॉटरमार्क के साथ टेस्ट पोस्ट भेजी जा रही है..."},
+                            timeout=6
+                        )
+                        ok = execute_news_post(
+                            state,
+                            models,
+                            force=True,
+                            single_client_channel=c_obj["channel_id"],
+                            single_client_brand=c_obj.get("brand_tag") or BRAND_TAG
+                        )
+                        msg_txt = "✅ आपके चैनल पर आपके कस्टम ब्रांड वॉटरमार्क के साथ पोस्ट भेज दी गई है!" if ok else "❌ पोस्ट नहीं जा सकी! कृपया चेक करें कि बॉट आपके चैनल में Admin है।"
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": chat_id, "text": msg_txt}, timeout=8)
+                    continue
+
+                # --- MASTER ADMIN ONLY BUTTONS ---
+                if not is_master(uid):
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        data={"callback_query_id": cb_id, "text": "🔒 यह बटन केवल Master Admin के लिए है!", "show_alert": True},
+                        timeout=5
+                    )
+                    continue
+
+                if data == "adm_clients":
+                    clients = state.get("clients", {})
+                    lines = ["👥 <b>Registered & Paid Clients List:</b>\n"]
+                    for k_uid, c_info in list(clients.items())[-20:]:
+                        paid_badge = "🟢 PAID" if is_client_active_and_paid(c_info) else "🔴 UNPAID"
+                        lines.append(
+                            f"• <b>{html.escape(c_info.get('name', 'User'))}</b> (<code>{k_uid}</code>) — {paid_badge}\n"
+                            f"  📢 Chan: <code>{html.escape(str(c_info.get('channel_id') or 'None'))}</code> | 🏷️ Brand: <code>{html.escape(str(c_info.get('brand_tag') or 'None'))}</code>"
+                        )
+                    if len(lines) == 1:
+                        lines.append("अभी कोई क्लाइंट रजिस्टर नहीं हुआ है।")
+                    lines.append("\n💡 <i>किसी को मैन्युअल 30 दिन अनलॉक करने के लिए</i> <code>/grant USER_ID</code> <i>लिखें।</i>")
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cb_id}, timeout=5)
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"},
+                        timeout=8
+                    )
+
+                elif data.startswith("set_"):
                     new_mins = int(data.split("_")[1])
                     state["interval_mins"] = new_mins
                     requests.post(
@@ -732,7 +989,7 @@ def poll_telegram_commands(state, models):
                         data={"callback_query_id": cb_id, "text": f"✅ Interval set to {format_interval(new_mins)}!"},
                         timeout=8
                     )
-                    send_or_edit_panel(chat_id, state, msg_id)
+                    send_or_edit_panel(chat_id, uid, uname, state, msg_id)
                     save_state(state, push_to_git=True)
 
                 elif data == "toggle_night":
@@ -742,7 +999,7 @@ def poll_telegram_commands(state, models):
                         data={"callback_query_id": cb_id, "text": "✅ Night mode updated!"},
                         timeout=8
                     )
-                    send_or_edit_panel(chat_id, state, msg_id)
+                    send_or_edit_panel(chat_id, uid, uname, state, msg_id)
                     save_state(state, push_to_git=True)
 
                 elif data == "post_now":
@@ -752,33 +1009,147 @@ def poll_telegram_commands(state, models):
                         timeout=8
                     )
                     ok = execute_news_post(state, models, force=True)
-                    send_or_edit_panel(chat_id, state, msg_id)
-                    status_msg = "✅ Top trending news posted to channel!" if ok else "⚠️ No new trending news found right now."
+                    send_or_edit_panel(chat_id, uid, uname, state, msg_id)
+                    status_msg = "✅ Top trending news posted to Master & Client channels!" if ok else "⚠️ No new trending news found right now."
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                         data={"chat_id": chat_id, "text": status_msg},
                         timeout=8
                     )
 
-            elif "message" in upd and "text" in upd["message"]:
+            # 3. Handle Messages & Successful Payments
+            elif "message" in upd:
                 msg = upd["message"]
                 if msg["chat"].get("type", "private") != "private":
                     continue
                 chat_id = msg["chat"]["id"]
-                text = msg["text"].strip().lower()
+                uid = msg.get("from", {}).get("id", chat_id)
+                uname = msg.get("from", {}).get("first_name", "User")
 
-                if text in ["/start", "/panel", "/settings", "/status", "panel", "menu"]:
-                    send_or_edit_panel(chat_id, state)
+                # A. Handle Successful ₹99 Stars Payment!
+                if "successful_payment" in msg:
+                    uid_str = str(uid)
+                    if "clients" not in state:
+                        state["clients"] = {}
+                    if uid_str not in state["clients"]:
+                        state["clients"][uid_str] = {"name": uname, "channel_id": "", "brand_tag": "", "active": True}
 
-                elif text.startswith("/set"):
-                    m = re.search(r"(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?", text)
+                    curr_exp = float(state["clients"][uid_str].get("expires_at", 0))
+                    base_ts = max(time.time(), curr_exp)
+                    state["clients"][uid_str]["paid"] = True
+                    state["clients"][uid_str]["expires_at"] = base_ts + (30 * 86400)
+                    save_state(state, push_to_git=True)
+
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        data={
+                            "chat_id": chat_id,
+                            "text": "🎉 <b>Payment Successful (₹99 Stars Plan Activated)!</b>\n\nअब आप नीचे दिए गए पैनल से अपना <b>Channel</b> और <b>Custom Brand Watermark</b> सेट कर सकते हैं:",
+                            "parse_mode": "HTML"
+                        },
+                        timeout=8
+                    )
+                    send_or_edit_panel(chat_id, uid, uname, state)
+
+                    # Notify Master Admin
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        data={
+                            "chat_id": ADMIN_ID,
+                            "text": f"💰 <b>New ₹99 Stars Subscription Received!</b>\n👤 User: {html.escape(uname)} (<code>{uid}</code>)\n✅ 30-Day Custom Branding Unlocked!",
+                            "parse_mode": "HTML"
+                        },
+                        timeout=8
+                    )
+                    continue
+
+                if "text" not in msg:
+                    continue
+
+                raw_text = msg["text"].strip()
+                low_text = raw_text.lower()
+
+                if low_text == "/cancel":
+                    user_input_states.pop(str(uid), None)
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": chat_id, "text": "✅ रद्द किया गया।"}, timeout=6)
+                    send_or_edit_panel(chat_id, uid, uname, state)
+                    continue
+
+                # B. Handle Step-by-Step Client Input (Channel ID or Brand Tag)
+                pending_action = user_input_states.get(str(uid))
+                if pending_action and not low_text.startswith("/"):
+                    user_input_states.pop(str(uid), None)
+                    if "clients" not in state:
+                        state["clients"] = {}
+                    if str(uid) not in state["clients"]:
+                        state["clients"][str(uid)] = {"name": uname, "paid": is_master(uid), "expires_at": time.time() + 30*86400, "active": True}
+
+                    if pending_action == "SET_CHAN":
+                        ch_val = raw_text
+                        if "t.me/" in ch_val:
+                            ch_val = "@" + ch_val.split("t.me/")[-1].strip("/")
+                        elif not ch_val.startswith("@") and not ch_val.startswith("-100"):
+                            ch_val = "@" + ch_val
+                        state["clients"][str(uid)]["channel_id"] = ch_val
+                        save_state(state, push_to_git=True)
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            data={"chat_id": chat_id, "text": f"✅ आपका चैनल <code>{html.escape(ch_val)}</code> सेव हो गया है!", "parse_mode": "HTML"},
+                            timeout=8
+                        )
+                        send_or_edit_panel(chat_id, uid, uname, state)
+                        continue
+
+                    elif pending_action == "SET_BRAND":
+                        b_val = raw_text[:28].strip()
+                        state["clients"][str(uid)]["brand_tag"] = b_val
+                        save_state(state, push_to_git=True)
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            data={"chat_id": chat_id, "text": f"✅ आपकी कस्टम ब्रांडिंग <b>{html.escape(b_val)}</b> सेट हो गई है! अब हर फोटो और पोस्ट पर यही नाम दिखेगा।", "parse_mode": "HTML"},
+                            timeout=8
+                        )
+                        send_or_edit_panel(chat_id, uid, uname, state)
+                        continue
+
+                # C. Standard Commands
+                if low_text in ["/start", "/panel", "/settings", "/status", "panel", "menu"]:
+                    send_or_edit_panel(chat_id, uid, uname, state)
+
+                elif is_master(uid) and low_text.startswith("/grant"):
+                    parts = raw_text.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        target_uid = parts[1]
+                        if "clients" not in state:
+                            state["clients"] = {}
+                        if target_uid not in state["clients"]:
+                            state["clients"][target_uid] = {"name": "VIP Client", "channel_id": "", "brand_tag": "", "active": True}
+                        state["clients"][target_uid]["paid"] = True
+                        state["clients"][target_uid]["expires_at"] = time.time() + (30 * 86400)
+                        save_state(state, push_to_git=True)
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": chat_id, "text": f"✅ User {target_uid} को 30 दिन का Pro Custom Branding एक्सेस दे दिया गया है!"}, timeout=8)
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": target_uid, "text": "🎉 Master Admin ने आपका 30-Day Pro Custom Branding प्लान एक्टिवेट कर दिया है! /start दबाकर अपनी ब्रांडिंग सेट करें।"}, timeout=8)
+                    else:
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": chat_id, "text": "Usage: /grant USER_ID"}, timeout=8)
+
+                elif is_master(uid) and low_text.startswith("/revoke"):
+                    parts = raw_text.split()
+                    if len(parts) >= 2 and parts[1] in state.get("clients", {}):
+                        target_uid = parts[1]
+                        state["clients"][target_uid]["paid"] = False
+                        state["clients"][target_uid]["expires_at"] = 0
+                        save_state(state, push_to_git=True)
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={"chat_id": chat_id, "text": f"🚫 User {target_uid} का एक्सेस बंद कर दिया गया है।"}, timeout=8)
+
+                elif is_master(uid) and low_text.startswith("/set"):
+                    m = re.search(r"(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?", low_text)
                     if m:
                         val = int(m.group(1))
                         unit = m.group(2) or "m"
                         mins = val * 60 if unit.startswith("h") else val
                         mins = max(5, min(1440, mins))
                         state["interval_mins"] = mins
-                        send_or_edit_panel(chat_id, state)
+                        send_or_edit_panel(chat_id, uid, uname, state)
                         save_state(state, push_to_git=True)
                     else:
                         requests.post(
@@ -796,7 +1167,7 @@ def run_cron_scheduler():
     start_ts = time.time()
     last_log_ts = 0
 
-    print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins | Pro Inshorts Mode")
+    print(f"[BOT STARTED] Active Interval: {state.get('interval_mins', 60)} mins | Pro Multi-Tenant SaaS Mode")
     while (time.time() - start_ts) < 19500:
         execute_news_post(state, models, force=False)
 
