@@ -36,6 +36,7 @@ RSS_FEEDS = [
     "https://feeds.feedburner.com/ndtvsports-latest",
     "https://feeds.feedburner.com/ndtvsports-cricket",
     "http://feeds.bbci.co.uk/sport/rss.xml",
+    "https://www.theguardian.com/sport/rss",
     "https://www.espn.com/espn/rss/news",
     "https://www.skysports.com/rss/12040"
 ]
@@ -59,7 +60,7 @@ JUNK_KEYWORDS = [
 
 COMPETITOR_BRANDS = [
     "ndtv sports", "ndtv", "espncricinfo", "cricinfo", "espn", "sky sports", "skysports",
-    "bbc sport", "bbc", "reuters", "pti", "associated press", "ani", "cricbuzz",
+    "bbc sport", "bbc", "reuters", "pti", "associated press", "ani", "cricbuzz", "the guardian",
     "times of india", "hindustan times", "indian express", "sportskeeda", "insidesport"
 ]
 
@@ -136,21 +137,16 @@ def load_state():
     return default_state
 
 def strip_links_and_brands(text):
-    """किसी भी बाहरी लिंक, रीडायरेक्ट, एरर कोड और दूसरी मीडिया कंपनियों के नाम को पूरी तरह हटाता है"""
+    """बाहरी लिंक्स, रीडायरेक्ट, एरर कोड और दूसरी मीडिया कंपनियों के नाम को पूरी तरह हटाता है"""
     if not text:
         return ""
     text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
-
-    # Remove server error strings (Akamai / Cloudflare / Reference #)
     text = re.sub(r"reference\s*#[\w\d.]+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"access denied.*", "", text, flags=re.IGNORECASE)
-
-    # Remove all URLs, domains, and @handles (except our own brand)
     text = re.sub(r"https?://\S+|www\.\S+", "", text)
     text = re.sub(r"\b[\w.-]+\.(edgesuite|net|com|org|in|co\.uk|tv|me|io)\S*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"@(?!SportsDuniyaOfficial\b)\w+", "", text, flags=re.IGNORECASE)
 
-    # Remove competitor brand names and trailing source tags (e.g. "- NDTV Sports")
     for brand in COMPETITOR_BRANDS:
         text = re.sub(rf"\b{re.escape(brand)}\b", "", text, flags=re.IGNORECASE)
 
@@ -159,7 +155,6 @@ def strip_links_and_brands(text):
     return text
 
 def is_fresh_entry(entry, max_hours=24):
-    """24 घंटे से पुरानी (बासी) खबरों को रोकता है"""
     t_struct = entry.get("published_parsed") or entry.get("updated_parsed")
     if not t_struct:
         return True
@@ -196,10 +191,9 @@ def score_entry(entry, index, trending_words_counter):
         if kw in text:
             score += 12
 
-    if any(k in text for k in ["india", "kohli", "rohit", "bumrah", "ipl", "bcci", "world cup", "champions trophy"]):
+    if any(k in text for k in ["india", "kohli", "rohit", "bumrah", "dhoni", "ipl", "bcci", "world cup", "csk", "rcb"]):
         score += 18
 
-    # Cross-Feed Trending Boost: अगर कोई टॉपिक कई न्यूज़ फीड्स में एक साथ चल रहा है
     words = [w for w in re.findall(r"[a-z]{4,}", title.lower()) if w not in {"with", "from", "that", "this", "after", "over", "into", "against"}]
     for w in set(words):
         if trending_words_counter.get(w, 0) >= 2:
@@ -228,8 +222,36 @@ def get_available_models():
         pass
     return models
 
+def extract_rss_image(entry):
+    """RSS एंट्री के अंदर मौजूद हर संभावित टैग से इमेज URL निकालता है"""
+    if "media_content" in entry and entry.media_content:
+        for mc in entry.media_content:
+            if mc.get("url"):
+                return mc["url"]
+    if "media_thumbnail" in entry and entry.media_thumbnail:
+        for mt in entry.media_thumbnail:
+            if mt.get("url"):
+                return mt["url"]
+    if "links" in entry:
+        for lnk in entry.links:
+            if "image" in str(lnk.get("type", "")) and lnk.get("href"):
+                return lnk["href"]
+    for field in ["storyimage", "image", "fullimage"]:
+        if entry.get(field) and isinstance(entry.get(field), str):
+            return entry.get(field)
+
+    raw_html = entry.get("summary", "") or entry.get("description", "")
+    if "content" in entry and entry.content:
+        raw_html += " " + " ".join([c.get("value", "") for c in entry.content])
+    if "<img" in raw_html:
+        soup = BeautifulSoup(raw_html, "html.parser")
+        img_tag = soup.find("img")
+        if img_tag and img_tag.get("src") and img_tag["src"].startswith("http"):
+            return img_tag["src"]
+    return None
+
 def get_article_data(entry, url):
-    image_url = None
+    image_url = extract_rss_image(entry)
     article_text = ""
 
     try:
@@ -237,14 +259,13 @@ def get_article_data(entry, url):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=9)
         if resp.ok and "edgesuite.net" not in resp.text.lower():
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # सबसे पहले आर्टिकल की हाई-रेज़ोल्यूशन og:image लें
             for meta_prop in [("property", "og:image"), ("name", "twitter:image")]:
                 tag = soup.find("meta", attrs={meta_prop[0]: meta_prop[1]})
-                if tag and tag.get("content"):
+                if tag and tag.get("content") and tag["content"].startswith("http"):
                     image_url = tag["content"].strip()
                     break
 
@@ -260,44 +281,86 @@ def get_article_data(entry, url):
     except Exception:
         pass
 
-    if not image_url:
-        if "media_content" in entry and entry.media_content:
-            image_url = entry.media_content[0].get("url")
-        elif "media_thumbnail" in entry and entry.media_thumbnail:
-            image_url = entry.media_thumbnail[0].get("url")
-
     return image_url, strip_links_and_brands(article_text)
 
-def download_real_hd_image(image_url, source_link=""):
-    """केवल असली और साफ HD स्पोर्ट्स फोटो डाउनलोड करता है (छोटे या टूटे आइकन छोड़ देता है)"""
-    if not image_url:
-        return None
-    clean_url = image_url.split("?")[0] if "ndtvimg.com" in image_url else image_url
-    encoded_clean = urllib.parse.quote(clean_url, safe="")
-    encoded_full = urllib.parse.quote(image_url, safe="")
-    stripped_scheme = re.sub(r"^https?://", "", clean_url)
+def search_bing_sports_image(query_title):
+    """अगर वेबसाइट (जैसे NDTV) ने फोटो ब्लॉक कर दी हो, तो Bing से उसी खबर की असली HD स्पोर्ट्स फोटो खोजता है"""
+    clean_q = re.sub(r"[^\w\s]", " ", query_title)
+    clean_q = " ".join(clean_q.split()[:9]) + " sports photo"
+    search_url = f"https://www.bing.com/images/search?q={urllib.parse.quote(clean_q)}&qft=+filterui:imagesize-large"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    try:
+        r = requests.get(search_url, headers=headers, timeout=10)
+        if r.ok:
+            urls = re.findall(r"murl&quot;:&quot;(https?://[^&]+?\.(?:jpg|jpeg|png))", r.text, flags=re.IGNORECASE)
+            if not urls:
+                urls = re.findall(r'"murl":"(https?://[^"]+?\.(?:jpg|jpeg|png))"', r.text, flags=re.IGNORECASE)
+            return urls[:6]
+    except Exception:
+        pass
+    return []
 
-    candidate_urls = [
-        image_url,
-        f"https://wsrv.nl/?url={encoded_clean}&w=1280&output=jpg",
-        f"https://wsrv.nl/?url={encoded_full}&output=jpg",
-        f"https://i0.wp.com/{stripped_scheme}"
-    ]
+def validate_and_normalize_image(raw_bytes):
+    """फोटो को चेक करता है और छोटा होने पर 1280px चौड़ाई में साफ HD रिसाइज़ करता है"""
+    try:
+        with Image.open(BytesIO(raw_bytes)) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if w < 220 or h < 140:
+                return None
+            if w < 800:
+                new_w = 1080
+                new_h = int(h * (1080 / float(w)))
+                im = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            out = BytesIO()
+            im.save(out, format="JPEG", quality=93)
+            return out.getvalue()
+    except Exception:
+        return None
+
+def download_real_hd_image(image_url, title="", source_link=""):
+    """100% गारंटीड रियल स्पोर्ट्स इमेज डाउनलोडर (RSS + Proxy + Bing HD Search Fallback)"""
+    candidate_urls = []
+
+    if image_url:
+        # Upgrade BBC / NDTV low-res URLs to high-res
+        upgraded = re.sub(r"/standard/\d+/", "/standard/1024/", image_url)
+        clean_url = upgraded.split("?")[0] if "ndtvimg.com" in upgraded else upgraded
+        encoded_clean = urllib.parse.quote(clean_url, safe="")
+        encoded_full = urllib.parse.quote(upgraded, safe="")
+        stripped_scheme = re.sub(r"^https?://", "", clean_url)
+
+        candidate_urls.extend([
+            f"https://wsrv.nl/?url={encoded_clean}&w=1200&output=jpg",
+            f"https://wsrv.nl/?url={encoded_full}&w=1200&output=jpg",
+            f"https://i0.wp.com/{stripped_scheme}",
+            clean_url,
+            upgraded
+        ])
+
+    # Add Bing HD Sports Image Search results as automatic fallback
+    if title:
+        bing_urls = search_bing_sports_image(title)
+        for b_url in bing_urls:
+            enc_b = urllib.parse.quote(b_url, safe="")
+            candidate_urls.append(b_url)
+            candidate_urls.append(f"https://wsrv.nl/?url={enc_b}&w=1200&output=jpg")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": source_link if source_link else "https://www.google.com/"
+        "Referer": "https://www.google.com/"
     }
 
     for try_url in candidate_urls:
         try:
-            r = requests.get(try_url, headers=headers, timeout=12)
-            if r.ok and len(r.content) > 8000:
-                with Image.open(BytesIO(r.content)) as test_im:
-                    w, h = test_im.size
-                    if w >= 380 and h >= 220:
-                        return r.content
+            r = requests.get(try_url, headers=headers, timeout=10)
+            if r.ok and len(r.content) > 3500:
+                valid_bytes = validate_and_normalize_image(r.content)
+                if valid_bytes:
+                    return valid_bytes
         except Exception:
             continue
     return None
@@ -311,7 +374,7 @@ def watermark_image_in_ram(image_bytes):
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        font_size = max(16, int(width * 0.028))
+        font_size = max(18, int(width * 0.028))
         font_paths = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
@@ -340,7 +403,7 @@ def watermark_image_in_ram(image_bytes):
         draw.rounded_rectangle(
             [box_x1, box_y1, box_x2, box_y2],
             radius=int(font_size * 0.5),
-            fill=(15, 20, 30, 210),
+            fill=(15, 20, 30, 215),
             outline=(255, 195, 0, 240),
             width=max(1, int(font_size * 0.08))
         )
@@ -365,12 +428,6 @@ def parse_ai_json_response(raw_text):
     return None
 
 def build_structured_post(title, description, extra_text, models):
-    """
-    हमेशा 100% सटीक स्ट्रक्चर बनाता है:
-    - ऊपर 2-लाइन बोल्ड हेडिंग (Line 1: Main Headline, Line 2: Sub-headline)
-    - नीचे 60 शब्दों की Human-Written Inshorts Summary
-    - 1-लाइन फैन कमेंट सवाल + SEO Hashtags
-    """
     clean_title = strip_links_and_brands(title)
     clean_desc = strip_links_and_brands(description)
     clean_extra = strip_links_and_brands(extra_text)
@@ -387,7 +444,7 @@ def build_structured_post(title, description, extra_text, models):
       "subheadline": "⚡ [Sharp 2nd-line sub-headline highlighting the key stat, score, or impact in 8 to 12 words]",
       "summary": "[Crisp Inshorts-style paragraph of strictly 55 to 65 words. Start with the biggest impact in sentence 1, followed by complete match/player context in natural human journalism style]",
       "question": "💬 [1-line engaging fan debate question ending with 'Drop your thoughts in the comments!']",
-      "hashtags": "[5 high-search organic SEO hashtags separated by spaces, e.g. #Cricket #RohitSharma #INDvsAUS #TeamIndia #SportsDuniya]"
+      "hashtags": "[5 high-search organic SEO hashtags separated by spaces, e.g. #Cricket #MSDhoni #IPL #TeamIndia #SportsDuniya]"
     }}
 
     Input Headline: {clean_title}
@@ -397,7 +454,6 @@ def build_structured_post(title, description, extra_text, models):
 
     parsed = None
 
-    # 1. Try Groq AI
     if GROQ_API_KEY:
         for groq_model in [
             "llama-3.3-70b-versatile",
@@ -432,7 +488,6 @@ def build_structured_post(title, description, extra_text, models):
             except Exception as e:
                 print(f"[GROQ WARN] {groq_model}: {e}")
 
-    # 2. Fallback to Gemini Flash Models
     if not parsed and GEMINI_API_KEY:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -451,7 +506,6 @@ def build_structured_post(title, description, extra_text, models):
             except Exception:
                 continue
 
-    # 3. Clean Fallback if both APIs are temporarily busy
     if not parsed or not parsed.get("headline") or not parsed.get("summary"):
         combined = f"{clean_desc} {clean_extra}".strip()
         words = combined.split()
@@ -495,17 +549,11 @@ def build_structured_post(title, description, extra_text, models):
     )
     return caption_html
 
-def post_to_telegram(image_url, caption_html, source_link=""):
-    img_bytes = download_real_hd_image(image_url, source_link)
-    if not img_bytes:
-        print("[IMAGE SKIP] No valid HD image found, trying next trending news...")
-        return False
-
+def post_to_telegram_with_bytes(img_bytes, caption_html):
     branded_buffer = watermark_image_in_ram(img_bytes)
 
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": branded_buffer}
-    # No inline_keyboard so Telegram's native Linked Group "Leave a comment" bar works!
     data = {
         "chat_id": TELEGRAM_CHANNEL_ID,
         "caption": caption_html[:1024],
@@ -516,7 +564,6 @@ def post_to_telegram(image_url, caption_html, source_link=""):
 
     branded_buffer.close()
     del branded_buffer
-    del img_bytes
     gc.collect()
 
     if not res.ok:
@@ -538,6 +585,7 @@ def execute_news_post(state, models, force=False):
 
     print(f"\n[POST TRIGGERED] IST: {ist_now.strftime('%I:%M %p')} | Interval: {interval_mins}m | Force: {force}")
     raw_entries = []
+    seen_Batch_titles = []
     word_counter = Counter()
     req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
 
@@ -555,6 +603,11 @@ def execute_news_post(state, models, force=False):
                 url_hash = hashlib.md5(link.encode("utf-8")).hexdigest()
                 if is_duplicate(url_hash, title, state):
                     continue
+                # एक ही स्कैन में अलग-अलग फीड्स की डुप्लीकेट खबरें हटाएं
+                if any(SequenceMatcher(None, title.lower(), st).ratio() > 0.65 for st in seen_Batch_titles):
+                    continue
+                seen_Batch_titles.append(title.lower())
+
                 words = [w for w in re.findall(r"[a-z]{4,}", title.lower()) if w not in {"with", "from", "that", "this", "after", "over", "into", "against"}]
                 word_counter.update(set(words))
                 raw_entries.append((idx, entry, link, url_hash, title))
@@ -570,23 +623,27 @@ def execute_news_post(state, models, force=False):
         candidates.append((score, entry, link, url_hash, title))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
-    print(f"[SCAN] Found {len(candidates)} fresh trending sports stories.")
+    print(f"[SCAN] Found {len(candidates)} unique trending sports stories.")
 
-    for score, entry, link, url_hash, title in candidates[:15]:
-        image_url, extra_text = get_article_data(entry, link)
-        if not image_url:
-            continue
+    for score, entry, link, url_hash, title in candidates[:12]:
         try:
+            image_url, extra_text = get_article_data(entry, link)
+            # पहले असली HD फोटो डाउनलोड करें (RSS या Bing Sports Image Search से) ताकि AI कॉल कभी बेकार न जाए
+            img_bytes = download_real_hd_image(image_url, title=title, source_link=link)
+            if not img_bytes:
+                print(f"[IMAGE SKIP] Could not fetch image for: {title}")
+                continue
+
             print(f"[POSTING] Trending Score {score}: {title}")
             caption_html = build_structured_post(title, entry.get("summary", ""), extra_text, models)
-            if post_to_telegram(image_url, caption_html, link):
+            if post_to_telegram_with_bytes(img_bytes, caption_html):
                 state["hashes"].append(url_hash)
                 state["titles"].append(title.lower())
                 state["last_post_ts"] = int(time.time())
                 save_state(state, push_to_git=True)
-                del caption_html, extra_text, image_url
+                del caption_html, extra_text, img_bytes
                 gc.collect()
-                print("[SUCCESS] Posted with 2-Line Heading, Inshorts Summary & @SportsDuniyaOfficial tag!")
+                print("[SUCCESS] Posted with HD Photo, 2-Line Heading & @SportsDuniyaOfficial watermark!")
                 return True
         except Exception as e:
             print(f"[RETRY] Failed '{title}': {e}")
